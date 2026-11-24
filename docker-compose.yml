@@ -1,0 +1,22 @@
+# Services de production. Pour l'instant, seul PostgreSQL est déclaré :
+# mlflow, backend, ui et le profil jupyter arrivent avec la tâche I1.
+# Avant le premier lancement : cp .env.example .env.production, puis renseigner les valeurs vides.
+name: neuraxion
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    env_file: .env.production
+    ports:
+      # Publié seulement sur la machine locale, sur 5433 pour ne pas gêner un PostgreSQL déjà installé.
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:

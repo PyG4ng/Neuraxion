@@ -1,0 +1,36 @@
+# Environnement et caches Python
+.venv/
+__pycache__/
+.pytest_cache/
+*.egg-info/
+
+# Données : jamais dans Git.
+# /data/ vise seulement le dossier à la racine : src/data/ et tests/data/ contiennent du code.
+/data/
+*.csv
+*.csv.gz
+*.parquet
+
+# MLflow local
+mlruns/
+mlartifacts/
+mlflow.db
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Interface React
+node_modules/
+dist/
+
+# Secrets : seuls les fichiers d'exemple sont versionnés
+.env
+.env.*
+!.env.example
+!.env.experiment.example
+
+# Journal IA : personnel, il reste sur chaque machine
+/docs/journal_ia/
+
+# macOS
+.DS_Store

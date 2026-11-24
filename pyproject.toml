@@ -1,0 +1,49 @@
+[project]
+name = "neuraxion"
+version = "0.1.0"
+description = "Octroi de crédit : probabilité de défaut d'un prêt, de l'exploration à la production"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi>=0.165.0",
+    "kagglehub>=1.0.3",
+    "mlflow>=3.18.0",
+    "numpy>=2.5.5",
+    "pandas>=3.1.1",
+    "psycopg[binary]>=3.3.9",
+    "pyarrow>=26.0.1",
+    "pydantic>=2.14.4",
+    "pyyaml>=6.0.4",
+    "scikit-learn>=1.9.1",
+    "uvicorn>=0.54.0",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.2.0",
+]
+notebooks = [
+    "jupyterlab>=4.6.6",
+    "matplotlib>=3.11.2",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.18,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv]
+# uv sync installe aussi les outils de test et les notebooks.
+# L'image de production (tâche I1) utilisera : uv sync --frozen --no-default-groups
+default-groups = ["dev", "notebooks"]
+
+[tool.uv.build-backend]
+# Le code forme un paquet nommé src, placé à la racine du dépôt.
+# Installé en mode éditable, il s'importe partout, notebooks compris : import src.training
+module-name = "src"
+module-root = ""
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Chaque lot a son dossier de tests et son conftest.py : ce mode évite les conflits de noms.
+addopts = "--import-mode=importlib"
