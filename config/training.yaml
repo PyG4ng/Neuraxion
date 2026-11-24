@@ -1,0 +1,106 @@
+# Protocole d'entraînement et de validation (contrat C2, lot P2).
+# Seule source de réglages pour POST /train et pour les notebooks de comparaison.
+# Les raisons de chaque choix sont dans docs/protocole_validation.md.
+# Le code lit ce fichier avec src.training.load_config(). Seul P2 le modifie (point 8 du plan).
+
+# Recopiée dans le tag protocole des runs de comparaison.
+# On la change si le protocole change, pour ne pas mélanger des runs incomparables.
+protocol_version: v1
+
+# Graine unique : échantillon du préréglage rapide, modèles, notebooks.
+seed: 42
+
+# Prêts étudiés : 36 mois, accordés de juin 2007 à décembre 2015, avec un statut terminé.
+# Les statuts terminés sont ceux de target.positive et target.negative.
+scope:
+  term_months: 36
+  issue_d_start: "2007-06-01"
+  issue_d_end: "2015-12-31"
+
+# Cible construite par clean() à partir de loan_status.
+# Les statuts sont écrits comme dans le jeu de données. Les autres statuts sont écartés.
+target:
+  column: target
+  source: loan_status
+  positive: # 1 : le prêt n'a pas été remboursé
+    - Charged Off
+    - Default
+    - "Does not meet the credit policy. Status:Charged Off"
+  negative: # 0 : le prêt a été remboursé
+    - Fully Paid
+    - "Does not meet the credit policy. Status:Fully Paid"
+
+# Découpage dans le temps, sur la date d'octroi. Les bornes sont incluses.
+split:
+  date_column: issue_d
+  train: { start: "2007-06-01", end: "2013-12-31" }
+  valid: { start: "2014-01-01", end: "2014-12-31" }
+  # Jamais lu par POST /train : 2015 n'entre pas dans PostgreSQL.
+  # Seul le notebook 08 l'ouvre, une seule fois, après le choix final.
+  test: { start: "2015-01-01", end: "2015-12-31" }
+
+# Évaluation métier : profit réalisé d'un prêt accepté = total_pymnt - funded_amnt.
+business:
+  amount_column: funded_amnt
+  paid_column: total_pymnt
+
+# Promotion (§6 du cahier des charges) : le modèle est promu si metric_new >= threshold.
+promotion:
+  metric: roc_auc
+  greater_is_better: true
+  # PROVISOIRE. La vraie valeur est la ROC-AUC du grade seul (A=1 à G=7) sur 2014,
+  # mesurée par P1 (D2) puis inscrite ici par P2 (M2).
+  threshold: 0.65
+
+# Seuil de décision : probabilité de défaut à partir de laquelle on refuse le prêt.
+# Ne pas le confondre avec promotion.threshold.
+# Règle appliquée partout (evaluate, /predict) : refus si la probabilité est >= au seuil.
+decision_threshold:
+  # Seuil qui maximise le profit réalisé des prêts acceptés sur la validation 2014.
+  # En cas d'égalité, on garde le plus petit seuil.
+  method: max_realized_profit
+  grid: { start: 0.01, stop: 0.99, step: 0.01 }
+
+# Configuration de référence des comparaisons : chaque notebook ne change qu'un facteur.
+# model : logistic_regression, hist_gradient_boosting ou random_forest.
+# model_params (facultatif) : paramètres passés au modèle, la graine est ajoutée d'office.
+# variables : V1 (variables du contrat) ou V2 (V1 plus montant sur revenu, solde
+#   renouvelable sur revenu, ancienneté du crédit et FICO moyen).
+# transformation : T1 (médiane ou mode, standardisation, one-hot) ou T2 (indicateurs de
+#   manquants, log1p des montants, regroupement des modalités rares).
+# Cette section ne change pas quand default change (M4) : les notebooks restent rejouables.
+reference:
+  model: logistic_regression
+  variables: V1
+  transformation: T1
+
+# Préréglages de POST /train, qui reçoit {"preset": "default" | "rapide" | "faible"}.
+# La validation est toujours toute l'année 2014.
+presets:
+  # Toute la période d'entraînement, moins de 2 minutes visé.
+  # Mis à jour par M4 avec la configuration finale.
+  default:
+    model: logistic_regression
+    variables: V1
+    transformation: T1
+    sample_size: null
+  # 50 000 prêts tirés avec la graine, moins de 30 secondes visé, pour la démonstration.
+  rapide:
+    model: logistic_regression
+    variables: V1
+    transformation: T1
+    sample_size: 50000
+  # Régression logistique sur deux variables, nettement sous le seuil, pour montrer un refus.
+  faible:
+    model: logistic_regression
+    variables: V1
+    transformation: T1
+    features: [loan_amnt, annual_inc]
+    sample_size: null
+
+# Tags des runs de comparaison (expérience credit-exploration, voir les conventions MLflow de P3).
+# Chaque run porte quatre tags : axe, variante, lot et protocole (= protocol_version).
+# variante est un texte court et libre, par exemple logreg, hgb, V2 ou T2.
+comparison_tags:
+  axe: [reference, modele, pipeline, transformation, seuil, synthese, test_final]
+  lot: [P1, P2, P3, P4, P5]
