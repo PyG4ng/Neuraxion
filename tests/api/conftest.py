@@ -1,8 +1,8 @@
 """Configuration commune des tests du lot P4 (dossier tests/api).
 
 Les tests ne contactent jamais de vraie base : les variables POSTGRES_* de la machine sont
-retirées de l'environnement pendant chaque test. Les tests contre un PostgreSQL réel sont dans
-tests/db (A2 et A4), qui lit ces variables.
+retirées de l'environnement pendant chaque test, comme MLFLOW_MODEL_NAME. Les tests contre un
+PostgreSQL réel sont dans tests/db (A2 et A4), qui lit ces variables.
 Le module src.registry.champion est remplacé par un faux qui ne renvoie aucun champion.
 """
 
@@ -13,11 +13,13 @@ import types
 import pytest
 
 POSTGRES_VARIABLES = ("POSTGRES_HOST", "POSTGRES_PORT", "POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB")
+# Lues dans .env.production quand on lance les tests avec uv run --env-file (docs/api.md, A4).
+MODEL_VARIABLES = ("MLFLOW_MODEL_NAME",)
 
 
 @pytest.fixture(autouse=True)
 def _no_real_database(monkeypatch):
-    for name in POSTGRES_VARIABLES:
+    for name in POSTGRES_VARIABLES + MODEL_VARIABLES:
         if name in os.environ:
             monkeypatch.delenv(name)
 

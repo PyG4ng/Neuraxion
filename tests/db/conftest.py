@@ -61,16 +61,35 @@ class Database:
     def rows(self, where: str = "TRUE", params: tuple = ()) -> list[dict]:
         """Lignes de inferences du schéma de test, de la plus ancienne à la plus récente."""
         with self.connect() as conn, conn.cursor(row_factory=dict_row) as cursor:
-            query = f"SELECT * FROM inferences WHERE {where} ORDER BY created_at"
-            return cursor.execute(query, params).fetchall()
+            query = sql.SQL("SELECT * FROM {}.inferences WHERE {} ORDER BY created_at")
+            return cursor.execute(query.format(sql.Identifier(self.schema), sql.SQL(where)), params).fetchall()
 
 
 def _configured_environ() -> dict[str, str]:
     return {name: os.environ[name] for name in POSTGRES_VARIABLES if os.environ.get(name)}
 
 
+def pytest_terminal_summary(terminalreporter):
+    """Signale en fin de session les tests sautés faute de base : « passé » ne veut pas dire « testé »."""
+    skipped = [
+        report
+        for report in terminalreporter.stats.get("skipped", [])
+        if isinstance(report.longrepr, tuple) and "PostgreSQL non configuré" in report.longrepr[2]
+    ]
+    if skipped:
+        terminalreporter.write_line(
+            f"Attention : {len(skipped)} tests PostgreSQL sautés (tests/db) : variables POSTGRES_* absentes. "
+            "Commande avec la base de Compose : docs/api.md, section A4.",
+            yellow=True,
+            bold=True,
+        )
+
+
 @pytest.fixture(autouse=True)
 def database(monkeypatch) -> Database:
+    # Un fichier de service libpq passerait avant PGOPTIONS (search_path, mais aussi hôte ou base).
+    for name in ("PGSERVICE", "PGSERVICEFILE"):
+        monkeypatch.delenv(name, raising=False)
     environ = _configured_environ()
     try:
         connection.connection_params(environ)
@@ -92,6 +111,15 @@ def database(monkeypatch) -> Database:
     monkeypatch.setenv("PGOPTIONS", f"-c search_path={schema}")
     monkeypatch.delenv("MLFLOW_MODEL_NAME", raising=False)
     try:
+        # Aucun test ne tourne si l'isolation n'est pas effective : plusieurs suppriment la table.
+        with connection.connect() as conn:
+            current = conn.execute("SELECT current_schema()").fetchone()[0]
+        if current != schema:
+            pytest.fail(
+                f"Isolation impossible : les connexions travaillent dans le schéma {current!r} et non dans le "
+                "schéma temporaire (PGOPTIONS ignoré). Aucun test n'a été lancé.",
+                pytrace=False,
+            )
         yield Database(environ, schema)
     finally:
         with connection.connect(environ) as conn:

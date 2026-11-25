@@ -98,6 +98,16 @@ def test_prediction_creates_a_row_with_the_version(make_app, registry, database,
     }
 
 
+def test_the_row_records_the_name_of_the_served_model(make_app, registry, database, valid_request, monkeypatch):
+    monkeypatch.setenv("MLFLOW_MODEL_NAME", "credit-default-v2")
+    registry.serve(version="6")
+    with TestClient(make_app()) as client:
+        body = client.post("/predict", json=valid_request).json()
+    (row,) = database.rows()
+    assert (row["model_name"], row["model_version"]) == (body["model_name"], body["model_version"])
+    assert (row["model_name"], row["model_version"]) == ("credit-default-v2", "6")
+
+
 def test_optional_field_absent_is_stored_as_null(make_app, registry, database, valid_request):
     registry.serve()
     with TestClient(make_app()) as client:
@@ -138,7 +148,7 @@ def test_table_dropped_after_startup_is_recreated(make_app, registry, database, 
     registry.serve()
     with TestClient(make_app()) as client:
         with database.connect() as conn:
-            conn.execute("DROP TABLE inferences")
+            conn.execute(sql.SQL("DROP TABLE {}.inferences").format(sql.Identifier(database.schema)))
         assert client.post("/predict", json=valid_request).status_code == 200
     assert len(database.rows()) == 1
 
@@ -160,6 +170,20 @@ def test_check_constraints_refuse_inconsistent_rows(database):
     with pytest.raises(psycopg.errors.CheckViolation):
         inferences.save_inference(record)
     assert database.rows() == []
+
+
+def test_save_inference_without_a_connection_commits_the_row(database):
+    init_db.create_schema()
+    record = inferences.InferenceRecord(
+        id=uuid4(),
+        created_at=datetime.now(UTC),
+        input_data={"loan_amnt": 1.0},
+        status="error",
+        latency_ms=1,
+        error_message="Ligne de test.",
+    )
+    assert inferences.save_inference(record) == record.id
+    assert [row["id"] for row in database.rows()] == [record.id]  # lue par une autre connexion
 
 
 def test_table_is_created_by_the_first_inference_when_the_database_was_down_at_startup(
@@ -188,16 +212,19 @@ def test_role_allowed_only_to_insert_can_record_inferences(make_app, registry, d
     schema = sql.Identifier(database.schema)
     with database.connect() as conn:
         conn.execute(sql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(sql.Identifier(role), sql.Literal(password)))
-        # Droits limités au schéma de test : le schéma public de la base n'est pas touché.
-        conn.execute(sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(schema, sql.Identifier(role)))
-        conn.execute(sql.SQL("GRANT INSERT ON inferences TO {}").format(sql.Identifier(role)))  # ni SELECT, ni CREATE
-        rights = conn.execute(
-            "SELECT has_table_privilege(%s, 'inferences', 'INSERT'), has_table_privilege(%s, 'inferences', 'SELECT'),"
-            " has_schema_privilege(%s, %s, 'CREATE')",
-            (role, role, role, database.schema),
-        ).fetchone()
-    assert rights == (True, False, False)
     try:
+        with database.connect() as conn:
+            # Droits limités au schéma de test : le schéma public de la base n'est pas touché.
+            conn.execute(sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(schema, sql.Identifier(role)))
+            conn.execute(  # ni SELECT, ni CREATE
+                sql.SQL("GRANT INSERT ON {}.inferences TO {}").format(schema, sql.Identifier(role))
+            )
+            rights = conn.execute(
+                "SELECT has_table_privilege(%s, 'inferences', 'INSERT'), has_table_privilege(%s, 'inferences', 'SELECT'),"
+                " has_schema_privilege(%s, %s, 'CREATE')",
+                (role, role, role, database.schema),
+            ).fetchone()
+        assert rights == (True, False, False)
         monkeypatch.setenv("POSTGRES_USER", role)
         monkeypatch.setenv("POSTGRES_PASSWORD", password)
         registry.serve()

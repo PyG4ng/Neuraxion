@@ -448,6 +448,15 @@ def test_model_name_defaults_to_the_environment_then_credit_default(make_app, da
     monkeypatch.setenv("MLFLOW_MODEL_NAME", "modele-env")
     with TestClient(make_app()) as client:
         assert client.post("/predict", json=VALID).json()["model_name"] == "modele-env"
+    Registry(monkeypatch, champion(name="autre-modele", version="7"))
+    with TestClient(make_app()) as client:
+        assert client.post("/predict", json=VALID).json()["model_name"] == "autre-modele"
+    # La ligne enregistrée porte le nom du modèle servi, pas une valeur fixe (A4).
+    assert [(row["model_name"], row["model_version"]) for row in database.rows] == [
+        ("credit-default", "3"),
+        ("modele-env", "3"),
+        ("autre-modele", "7"),
+    ]
 
 
 # --- sans modèle : 503 -------------------------------------------------------------

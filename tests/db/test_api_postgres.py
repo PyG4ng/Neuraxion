@@ -3,8 +3,8 @@
 - §13 n° 3 : POST /predict avec une entrée valide, puis une entrée invalide ;
 - §13 n° 4 et critère I : une prédiction réussie est retrouvable dans PostgreSQL avec la
   version du modèle, y compris après une promotion par POST /train ;
-- POST /train sans clé et avec une mauvaise clé : refusé, sans entraînement, sans
-  rechargement et sans ligne en base.
+- POST /train sans clé, avec une mauvaise clé, ou sans TRAIN_API_KEY sur le serveur : refusé,
+  sans entraînement, sans rechargement et sans ligne en base.
 
 Les mêmes comportements sont testés sans base dans tests/api (test_predict.py, test_train.py).
 Base, schéma temporaire et faux @champion : voir conftest.py. Sautés sans POSTGRES_*.
@@ -111,6 +111,22 @@ def test_train_without_key_or_with_a_wrong_key_changes_nothing(
     assert database.rows() == []
     served = client.post("/predict", json=valid_request).json()
     assert served["model_version"] == "3"
+    assert [row["model_version"] for row in database.rows()] == ["3"]
+
+
+@pytest.mark.parametrize("server_value", [None, "", "   "], ids=["absente", "vide", "espaces"])
+def test_train_stays_closed_when_the_server_key_is_not_configured(
+    client, database, registry, trainer, valid_request, monkeypatch, server_value
+):
+    if server_value is None:
+        monkeypatch.delenv("TRAIN_API_KEY")
+    else:
+        monkeypatch.setenv("TRAIN_API_KEY", server_value)
+    response = client.post("/train", headers={"X-API-Key": KEY}, json={"preset": "rapide"})
+    assert (response.status_code, response.json()["code"]) == (403, "FORBIDDEN")
+    assert trainer.presets == []
+    assert registry.loads == 1
+    assert client.post("/predict", json=valid_request).json()["model_version"] == "3"
     assert [row["model_version"] for row in database.rows()] == ["3"]
 
 

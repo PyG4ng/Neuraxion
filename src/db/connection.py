@@ -23,7 +23,8 @@ def connection_params(environ: Mapping[str, str] | None = None) -> dict[str, str
     """Paramètres de psycopg.connect lus dans l'environnement.
 
     POSTGRES_HOST vaut localhost et POSTGRES_PORT 5432 par défaut. Dans Compose, ce sont
-    postgres et 5432 ; depuis la machine hôte, localhost et 5433.
+    postgres et 5432 ; depuis la machine hôte, 127.0.0.1 et 5433 (sous Windows, localhost essaie
+    d'abord ::1, où Compose ne publie pas le port, et chaque connexion perd 2 s).
 
     Lève
         DatabaseNotConfigured si POSTGRES_USER, POSTGRES_PASSWORD ou POSTGRES_DB est vide, ou si
