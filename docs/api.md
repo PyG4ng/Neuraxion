@@ -303,7 +303,7 @@ Ce que la route attend de R2 :
 Quand R2 sera livrée, il restera à :
 
 1. vérifier que la valeur renvoyée par `train_and_promote` passe `TrainResponse` (un test de bout en bout avec le préréglage `rapide`) ;
-2. vérifier, avec A2, que `/predict` renvoie la nouvelle version après une promotion (critère de l'issue #21) ;
+2. vérifier avec le vrai `@champion` de R1 que `/predict` renvoie la nouvelle version après une promotion (critère de l'issue #21). Avec un faux `@champion` et le vrai `app.state.reload_model` de A2, c'est déjà testé : `tests/api/test_train.py::test_a_promotion_makes_predict_serve_the_new_version`, et sur PostgreSQL `tests/db/test_api_postgres.py::test_the_recorded_version_follows_a_promotion` ;
 3. retirer de ce document la mention « 501 tant que R2 n'est pas livrée » du tableau des routes.
 
 Les tests (`tests/api/test_train.py`) remplacent `train_and_promote` par une fausse fonction (`app.dependency_overrides[train.get_train_and_promote]`) ou par un faux module `src.registry.promotion`.
@@ -481,6 +481,57 @@ FROM inferences
 ORDER BY created_at DESC
 LIMIT 5;
 ```
+
+## Tests de l'API et de la base (A4)
+
+Deux dossiers :
+
+- `tests/api` : l'API sans base ni MLflow (fausses connexions, faux `@champion`, fausse `train_and_promote`). Les variables `POSTGRES_*` y sont retirées pendant chaque test ;
+- `tests/db` : l'application complète contre un vrai PostgreSQL, configuré par les variables `POSTGRES_*` (`src/db/connection.py`).
+
+Sans base, les 24 tests de `tests/db` sont sautés :
+
+```bash
+uv run pytest tests/api tests/db
+```
+
+Résultat attendu : 511 tests réussis et 24 sautés, avec un avertissement final qui rappelle que les tests PostgreSQL n'ont pas tourné.
+
+Avec le PostgreSQL de Compose (depuis la racine du dépôt, `.env.production` rempli) :
+
+```bash
+docker compose up -d --wait postgres
+POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=5433 uv run --env-file .env.production pytest tests/api tests/db
+```
+
+Sous PowerShell :
+
+```powershell
+docker compose up -d --wait postgres
+$env:POSTGRES_HOST = "127.0.0.1"; $env:POSTGRES_PORT = "5433"
+uv run --env-file .env.production pytest tests/api tests/db
+```
+
+Résultat attendu : 535 tests réussis, aucun sauté.
+
+Pour séparer tout à fait les tests de l'historique, on peut aussi les lancer sur une base dédiée du même serveur, créée une fois : `docker compose exec postgres createdb -U neuraxion neuraxion_test` (l'utilisateur est celui de `.env.production`), puis ajouter `POSTGRES_DB=neuraxion_test` devant la commande ci-dessus. `uv run --env-file` lit l'utilisateur, le mot de passe et la base dans `.env.production` ; les variables déjà posées dans le terminal passent avant celles du fichier, si bien que `POSTGRES_HOST=postgres` et `POSTGRES_PORT=5432`, valables entre conteneurs, sont remplacés par l'adresse vue depuis la machine. Écrire `127.0.0.1` plutôt que `localhost` : sous Windows, `localhost` essaie d'abord `::1`, où Compose ne publie pas le port, et chaque connexion perd alors 2 s (`GET /health` répond `degraded`).
+
+Règles de `tests/db/conftest.py` :
+
+- sans `POSTGRES_USER`, `POSTGRES_PASSWORD` ou `POSTGRES_DB`, chaque test est sauté et le motif le dit ;
+- `POSTGRES_PORT` qui n'est pas un entier, ou base configurée mais injoignable : chaque test échoue, avec le type de l'erreur et l'adresse à vérifier, pour qu'une base arrêtée ne passe pas pour un succès ;
+- chaque test travaille dans un schéma temporaire `neuraxion_test_...`, supprimé à la fin. `PGOPTIONS` le place seul dans le `search_path` de toutes les connexions du processus : les connexions ouvertes par l'API et par les tests n'écrivent pas dans la table `inferences` du schéma `public`, qui garde l'historique de la base de Compose (un test le vérifie). Un code qui changerait lui-même son `search_path` échapperait à cette protection : `src/` n'en contient aucun. `PGSERVICE` et `PGSERVICEFILE` sont retirés, car un fichier de service passerait avant `PGOPTIONS`. Avant chaque test, la fixture vérifie que `current_schema()` est bien le schéma temporaire, et sinon échoue sans lancer le test ;
+- un processus tué en plein test (Ctrl+C répété, coupure) peut laisser un schéma `neuraxion_test_...`. Pour les lister, quand aucun test ne tourne : `SELECT nspname FROM pg_namespace WHERE nspname LIKE 'neuraxion\_test\_%';`, puis `DROP SCHEMA <nom> CASCADE;` pour chacun ;
+- un test crée un rôle temporaire `neuraxion_api_limitee_...`, qui a seulement le droit d'insérer, puis le supprime. L'utilisateur de `.env.production` doit donc pouvoir créer un schéma et un rôle, ce qui est le cas de l'utilisateur créé par l'image `postgres` ;
+- le `@champion` (R1) est remplacé par un faux module `src.registry.champion`, et `train_and_promote` (R2) par une fausse fonction : ni MLflow ni entraînement réel.
+
+Vérifications du §13 et de l'issue #22 :
+
+| Vérification | Sans base (`tests/api`) | Avec PostgreSQL (`tests/db`) |
+|---|---|---|
+| §13 n° 3 : `POST /predict` avec une entrée valide et une entrée invalide | `test_predict.py` (`test_prediction_returns_a_decision_and_records_one_row_with_the_version`, `test_unknown_fields_are_refused_and_not_recorded`, `test_validation_errors_are_not_recorded`) | `test_api_postgres.py::test_valid_then_invalid_request_and_the_documented_query` |
+| §13 n° 4 et critère I : une prédiction réussie est enregistrée avec la version du modèle | `test_predict.py` (même test, sur une fausse connexion ; `test_model_name_defaults_to_the_environment_then_credit_default` pour le nom) | `test_predict_postgres.py::test_prediction_creates_a_row_with_the_version` et `test_the_row_records_the_name_of_the_served_model` ; `test_api_postgres.py` : requête SQL de la section « Table inferences », version après une promotion, lignes gardées après un redémarrage |
+| `POST /train` sans clé et avec une mauvaise clé | `test_train.py` (`test_without_header_answers_401_in_the_common_format`, `test_a_wrong_key_answers_403`) | `test_api_postgres.py::test_train_without_key_or_with_a_wrong_key_changes_nothing` : 401 ou 403, ni entraînement, ni rechargement, ni ligne en base ; `test_train_stays_closed_when_the_server_key_is_not_configured` : 403 si `TRAIN_API_KEY` est absente, vide ou faite d'espaces |
 
 ## Points à confirmer à la revue des contrats (C6)
 
