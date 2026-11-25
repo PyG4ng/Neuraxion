@@ -11,13 +11,12 @@ import subprocess
 import sys
 import threading
 import time
-from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
 import yaml
 from pydantic import BaseModel, field_validator
-from fastapi import APIRouter, BackgroundTasks
+from fastapi import BackgroundTasks
 from fastapi.responses import StreamingResponse
 from fastapi.testclient import TestClient
 from starlette.exceptions import HTTPException
@@ -147,8 +146,10 @@ def test_schema_returns_the_validation_schema_and_examples(client):
 def test_schema_examples_are_accepted_by_predict(client):
     examples = client.get("/schema").json()["examples"]
     for example in examples.values():
-        # La validation passe : la route vide répond 501, pas 422.
-        assert client.post("/predict", json=example).status_code == 501
+        # La validation passe : sans champion, la route répond 503, pas 422.
+        response = client.post("/predict", json=example)
+        assert response.status_code == 503
+        assert response.json()["code"] == "MODEL_UNAVAILABLE"
 
 
 def test_schema_reports_missing_contract_version(make_app):
@@ -299,7 +300,7 @@ def test_unexpected_error_gets_500_without_its_message(make_app, caplog):
 
 def test_existing_stub_routes_still_answer_501(client):
     feedback = {"inference_id": "6f1c2a7e-3b4d-4c8a-9e21-5d7f0a1b2c3d", "feedback": "agree"}
-    for route, body in (("/predict", VALID), ("/train", {"preset": "rapide"}), ("/feedback", feedback)):
+    for route, body in (("/train", {"preset": "rapide"}), ("/feedback", feedback)):
         response = client.post(route, json=body)
         assert response.status_code == 501
         assert response.json()["code"] == "NOT_IMPLEMENTED"
@@ -520,7 +521,8 @@ def test_integer_with_allowed_values_stays_strict(tmp_path):
     for raw, message in cases.items():
         response = client.post("/predict", content='{"term": %s}' % raw, headers={"content-type": "application/json"})
         assert response.json()["errors"] == [{"field": "term", "message": message}], raw
-    assert client.post("/predict", json={"term": 36}).status_code == 501
+    # Validation passée : sans champion, 503.
+    assert client.post("/predict", json={"term": 36}).status_code == 503
     published = client.get("/schema").json()["request_schema"]["properties"]["term"]
     assert published["enum"] == [36, 60]
     assert published["type"] == "integer"
@@ -685,20 +687,21 @@ def test_unknown_pydantic_error_types_fall_back_to_french():
 
 
 def test_router_lifespan_can_fill_model_info(tmp_path, monkeypatch):
-    # Raccord A2 : un lifespan posé sur le routeur predict remplit app.state.model_info.
-    original = main.predict.build_router
+    # Raccord A2 : le lifespan du routeur predict remplit app.state.model_info.
+    class Model:
+        classes_ = [0, 1]
 
-    def build_router_with_lifespan(request_model):
-        @asynccontextmanager
-        async def lifespan(application):
-            application.state.model_info = MODEL
-            yield
+        def predict_proba(self, frame):
+            return [[0.8, 0.2]]
 
-        router = APIRouter(lifespan=lifespan)
-        router.include_router(original(request_model))
-        return router
-
-    monkeypatch.setattr(main.predict, "build_router", build_router_with_lifespan)
+    champion = {
+        "model": Model(),
+        "name": MODEL.name,
+        "version": MODEL.version,
+        "decision_threshold": MODEL.decision_threshold,
+        "features": [feature["name"] for feature in CONTRACT["features"]],
+    }
+    monkeypatch.setattr(main.predict.served_model, "load_champion_from_registry", lambda: champion)
     contract_path, examples_path = write_files(tmp_path)
     app = main.create_app(contract_path, examples_path, database_check=lambda: True)
     with TestClient(app) as client:
@@ -987,8 +990,9 @@ def test_optional_numeric_list_publishes_null_like_the_api_accepts_it(tmp_path, 
     assert {"type": "null"} in branches
     assert {"type": json_type, "enum": allowed, "minimum": 0} in branches
     assert "enum" not in published
-    assert client.post("/predict", json={"score": None}).status_code == 501
-    assert client.post("/predict", json={"score": allowed[0]}).status_code == 501
+    # Validation passée : sans champion, 503.
+    assert client.post("/predict", json={"score": None}).status_code == 503
+    assert client.post("/predict", json={"score": allowed[0]}).status_code == 503
     assert client.post("/predict", json={"score": 2}).status_code == 422
 
 

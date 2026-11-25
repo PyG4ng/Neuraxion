@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from src.api import feedback, predict, schemas, train
+from src.api.errors import install_error_handlers
 
 DOC_PATH = Path(__file__).resolve().parents[2] / "docs" / "api.md"
 EXAMPLE_PATTERN = re.compile(r"<!-- exemple: (\w+) -->\s*```json\s*(.*?)```", re.DOTALL)
@@ -36,6 +37,7 @@ def _doc_contract() -> dict:
 @pytest.fixture
 def client(small_contract) -> TestClient:
     app = FastAPI()
+    install_error_handlers(app)  # comme main.py : POST /predict lève ApiError
     app.include_router(predict.build_router(schemas.build_request_model(small_contract)))
     app.include_router(train.router)
     app.include_router(feedback.router)
@@ -162,7 +164,6 @@ def test_request_model_refuses_broken_contracts(contract):
 @pytest.mark.parametrize(
     ("route", "body", "task"),
     [
-        ("/predict", VALID_REQUEST, "A2"),
         ("/train", {"preset": "rapide"}, "A3"),
         ("/feedback", {"inference_id": "6f1c2a7e-3b4d-4c8a-9e21-5d7f0a1b2c3d", "feedback": "agree"}, "F1"),
     ],
@@ -247,12 +248,13 @@ def test_train_without_preset_uses_default_and_reaches_the_stub(client, body):
 
 def test_wire_codes_are_the_documented_strings(client):
     # Valeur littérale, indépendante de l'énumération : un client se fie à cette chaîne.
-    assert client.post("/predict", json=VALID_REQUEST).json()["code"] == "NOT_IMPLEMENTED"
+    assert client.post("/predict", json=VALID_REQUEST).json()["code"] == "MODEL_UNAVAILABLE"
+    assert client.post("/train", json={"preset": "rapide"}).json()["code"] == "NOT_IMPLEMENTED"
 
 
 def test_openapi_announces_the_documented_error_statuses(client):
     paths = client.get("/openapi.json").json()["paths"]
-    expected = {"/predict": {"422", "501", "503"}, "/train": {"401", "403", "409", "422", "501"}, "/feedback": {"404", "422", "501"}}
+    expected = {"/predict": {"422", "500", "503"}, "/train": {"401", "403", "409", "422", "501"}, "/feedback": {"404", "422", "501"}}
     for path, statuses in expected.items():
         assert statuses <= set(paths[path]["post"]["responses"])
 

@@ -327,6 +327,22 @@ def _value_matches(kind: str, value: Any) -> bool:
     return _is_number(value)
 
 
+def _without_nul(value: str) -> str:
+    """Validateur : texte sans caractère NUL (erreur string_unicode, sans la valeur)."""
+    if "\x00" in value:
+        raise PydanticCustomError("string_unicode", "doit être une chaîne de caractères valide")
+    return value
+
+
+def _exact_integer(value: int) -> int:
+    """Validateur : entier représentable exactement en float64 (bornes ±2**53)."""
+    if value > MAX_EXACT_INTEGER:
+        raise PydanticCustomError("less_than_equal", "trop grand", {"le": MAX_EXACT_INTEGER})
+    if value < -MAX_EXACT_INTEGER:
+        raise PydanticCustomError("greater_than_equal", "trop petit", {"ge": -MAX_EXACT_INTEGER})
+    return value
+
+
 def _member_of(allowed: list[Any]) -> Any:
     """Validateur : la valeur fait partie de la liste du contrat (erreur de type not_allowed)."""
     listed = ", ".join(map(str, allowed))
@@ -370,9 +386,12 @@ def _field_definition(feature: dict[str, Any]) -> tuple[Any, Any]:
             raise ValueError(f"{name} : une valeur de allowed ne correspond pas au type {kind}.")
         if kind != "categorical" and not all(math.isfinite(value) for value in allowed):
             raise ValueError(f"{name} : allowed ne contient que des nombres finis.")
-        if kind == "numeric" and any(isinstance(value, int) and abs(value) > MAX_EXACT_INTEGER for value in allowed):
-            # Une variable numeric est lue en float : au-delà de 2**53, deux entiers se confondent.
+        if kind != "categorical" and any(isinstance(value, int) and abs(value) > MAX_EXACT_INTEGER for value in allowed):
+            # Le modèle reçoit des float64 : au-delà de 2**53, deux entiers se confondent.
             raise ValueError(f"{name} : une valeur de allowed est trop grande pour être comparée sans perte.")
+        if kind == "categorical" and any("\x00" in value for value in allowed):
+            # PostgreSQL refuse le caractère NUL dans un jsonb : la valeur ne pourrait pas être enregistrée.
+            raise ValueError(f"{name} : une valeur de allowed contient le caractère NUL.")
         if any((low is not None and value < low) or (high is not None and value > high) for value in allowed):
             raise ValueError(f"{name} : une valeur de allowed sort des bornes min et max.")
         if len(set(allowed)) != len(allowed):
@@ -407,15 +426,24 @@ def _field_definition(feature: dict[str, Any]) -> tuple[Any, Any]:
             metadata.append(annotated_types.Le(high))
             published["maximum"] = high
         annotation = Annotated[base, *metadata, _member_of(allowed), WithJsonSchema(published)]
-    else:
+    elif kind == "numeric":
         annotation = base
         constraints["strict"] = True
-        if kind == "numeric":
-            constraints["allow_inf_nan"] = False
+        constraints["allow_inf_nan"] = False
         if low is not None:
             constraints["ge"] = low
         if high is not None:
             constraints["le"] = high
+    else:
+        # Contraintes posées sur le type lui-même, avant l'union avec None d'un champ
+        # facultatif : le JSON Schema publié garde minimum et maximum dans la branche du type.
+        bounds = {key: value for key, value in (("ge", low), ("le", high)) if value is not None}
+        if kind == "categorical":
+            # PostgreSQL refuse le caractère NUL dans un jsonb : l'inférence ne pourrait pas être enregistrée.
+            annotation = Annotated[str, Field(strict=True), AfterValidator(_without_nul)]
+        else:
+            # Un entier au-delà de 2**53 ne passe pas toujours sans perte en float64 pour le modèle.
+            annotation = Annotated[int, Field(strict=True, **bounds), AfterValidator(_exact_integer)]
 
     if feature.get("example") is not None:
         try:

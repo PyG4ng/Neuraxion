@@ -138,7 +138,7 @@ def test_body_overflow_after_a_streaming_response_started_sends_no_second_respon
 def test_non_numeric_content_length_is_ignored(tmp_path):
     app = build(tmp_path)
     sent = asgi_call(app, "/predict", [json.dumps(VALID).encode()], headers=[(b"content-length", b"abc")])
-    assert statuses(sent) == [501]
+    assert statuses(sent) == [503]  # validation passée, sans champion
 
 
 # [E23]
