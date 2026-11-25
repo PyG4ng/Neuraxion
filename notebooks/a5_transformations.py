@@ -143,6 +143,11 @@ AMOUNT_COLUMNS = ("loan_amnt", "annual_inc", "revol_bal", "tot_cur_bal", "total_
 RARE_MIN_FREQUENCY = 0.01
 
 
+# Types de variable acceptés dans le contrat. Un booléen est traité comme un nombre 0/1.
+NUMERIC_TYPES = ("numeric", "number", "integer", "int", "int64", "float", "float64", "boolean", "bool")
+CATEGORICAL_TYPES = ("categorical", "category", "string", "str")
+
+
 @dataclass(frozen=True)
 class FeatureSpec:
     """Variables d'entrée, rangées selon la transformation qu'elles reçoivent."""
@@ -186,12 +191,12 @@ def feature_spec(contract: Mapping[str, Any] | None) -> FeatureSpec:
         if name in FORBIDDEN_COLUMNS:
             raise ValueError(f"{name} est une colonne interdite : elle ne peut pas être une variable.")
         kind = entry.get("type")
-        if kind in ("numeric", "integer", "number", "float"):
+        if kind in NUMERIC_TYPES:
             numeric.append(name)
             unit = str(entry.get("unit") or "").strip().casefold()
             if unit in AMOUNT_UNITS or name in AMOUNT_COLUMNS:
                 amounts.append(name)
-        elif kind in ("categorical", "category", "string"):
+        elif kind in CATEGORICAL_TYPES:
             categorical.append(name)
         else:
             raise ValueError(f"Type inconnu pour {name} : {kind!r}.")
@@ -238,7 +243,15 @@ def make_t1(spec: FeatureSpec) -> ColumnTransformer:
     )
 
 
-def make_t2(spec: FeatureSpec, min_frequency: float = RARE_MIN_FREQUENCY) -> ColumnTransformer:
+def make_t2(
+    spec: FeatureSpec,
+    min_frequency: float = RARE_MIN_FREQUENCY,
+    *,
+    log_amounts: bool = True,
+    indicators: bool = True,
+    rare: bool = True,
+    indicator_exclude: Sequence[str] = (),
+) -> ColumnTransformer:
     """T2 : T1, plus indicateurs de manquants, log1p des montants et regroupement des modalités rares.
 
     - Indicateurs : une colonne 0/1 par variable qui a des manquants dans l'entraînement
@@ -248,28 +261,34 @@ def make_t2(spec: FeatureSpec, min_frequency: float = RARE_MIN_FREQUENCY) -> Col
       négatif donnerait un log non défini : il devient manquant, puis reçoit la médiane.
       En pratique clean() a déjà mis à manquant les valeurs impossibles.
     - Modalités rares : moins de min_frequency (1 %) des prêts d'entraînement, regroupées
-      dans une seule colonne, qui reçoit aussi les modalités jamais vues.
+      dans une seule colonne, qui reçoit aussi les modalités jamais vues (T1 leur donne une
+      ligne de zéros).
+
+    Les options log_amounts, indicators et rare retirent un ajout à la fois, et
+    indicator_exclude retire l'indicateur de certaines colonnes : elles servent à l'ablation
+    du notebook. Avec les trois options à False, on retrouve T1.
     """
-    amounts = [c for c in spec.numeric if c in spec.amounts]
-    others = [c for c in spec.numeric if c not in spec.amounts]
-    log_amounts = Pipeline(
+    amounts = [c for c in spec.numeric if c in spec.amounts] if log_amounts else []
+    others = [c for c in spec.numeric if c not in amounts]
+    flagged = [c for c in spec.all if c not in set(indicator_exclude)] if indicators else []
+    log_pipeline = Pipeline(
         [
             ("log1p", FunctionTransformer(_log1p_nonnegative, feature_names_out="one-to-one")),
             ("imputer", SimpleImputer(strategy="median")),
             ("scaler", StandardScaler()),
         ]
     )
+    steps = [
+        ("montants", log_pipeline, amounts),
+        ("numeriques", _numeric_t1(), others),
+        ("categorielles", _categorical(min_frequency if rare else None), list(spec.categorical)),
+    ]
+    if flagged:
+        steps.append(
+            ("manquants", MissingIndicator(features="missing-only", error_on_new=False), flagged)
+        )
     return ColumnTransformer(
-        [
-            ("montants", log_amounts, amounts),
-            ("numeriques", _numeric_t1(), others),
-            ("categorielles", _categorical(min_frequency), list(spec.categorical)),
-            (
-                "manquants",
-                MissingIndicator(features="missing-only", error_on_new=False),
-                spec.all,
-            ),
-        ],
+        steps,
         remainder="drop",
         verbose_feature_names_out=True,
     )
@@ -315,10 +334,15 @@ def make_pipeline(transformation: str, spec: FeatureSpec, seed: int) -> Pipeline
     2000 pour laisser lbfgs converger ; un avertissement de non-convergence est relevé par le
     notebook et compté comme un échec partiel.
     """
+    return make_pipeline_from(TRANSFORMATIONS[transformation](spec), seed)
+
+
+def make_pipeline_from(transformer: ColumnTransformer, seed: int) -> Pipeline:
+    """Même pipeline que make_pipeline, avec une transformation donnée (ablation du notebook)."""
     return Pipeline(
         [
             ("types", FunctionTransformer(to_sklearn_types, feature_names_out="one-to-one")),
-            ("transformation", TRANSFORMATIONS[transformation](spec)),
+            ("transformation", transformer),
             ("model", LogisticRegression(max_iter=2000, random_state=seed)),
         ]
     )
@@ -327,14 +351,29 @@ def make_pipeline(transformation: str, spec: FeatureSpec, seed: int) -> Pipeline
 # ---------------------------------------------------------------------------------------
 # Remplaçants des fonctions du protocole (src.training, PR #44, M1 et M2)
 # ---------------------------------------------------------------------------------------
-def clean_local(df: pd.DataFrame, cfg: Mapping[str, Any]) -> pd.DataFrame:
-    """Version minimale de clean() (M1) : cible, périmètre, dates, doublons.
+# Valeurs impossibles mises à manquant par clean_local, comme le prévoit clean() (M1) :
+# revenu nul ou négatif, montant ou ratio négatif.
+POSITIVE_COLUMNS = ("annual_inc",)
+NONNEGATIVE_COLUMNS = ("loan_amnt", "revol_bal", "dti", "revol_util", "tot_cur_bal", "total_rev_hi_lim")
 
-    Ne fait pas ce que M1 doit ajouter (valeurs impossibles, variables dérivées, types du
-    contrat). Le DataFrame reçu n'est pas modifié.
+
+def clean_local(df: pd.DataFrame, cfg: Mapping[str, Any]) -> pd.DataFrame:
+    """Version minimale de clean() (M1) : cible, valeurs impossibles, dates, périmètre, doublons.
+
+    Le filtre du périmètre (36 mois, juin 2007 à décembre 2015) double celui de l'ingestion
+    (D1) : il ne retire rien sur des données déjà ingérées. Ne fait pas ce que M1 doit
+    ajouter en plus (variables dérivées, types du contrat). Les règles portent sur chaque
+    ligne seule : aucune statistique n'est calculée sur l'ensemble des prêts, donc 2014 ne
+    peut pas influencer l'entraînement par ce chemin. Le DataFrame reçu n'est pas modifié.
     """
     target = cfg["target"]
     out = df.copy()
+    for col in POSITIVE_COLUMNS:
+        if col in out.columns:
+            out[col] = out[col].where(~(out[col] <= 0))
+    for col in NONNEGATIVE_COLUMNS:
+        if col in out.columns:
+            out[col] = out[col].where(~(out[col] < 0))
     mapping = {s: 1 for s in target["positive"]} | {s: 0 for s in target["negative"]}
     out[target["column"]] = out[target["source"]].map(mapping)
     out = out.dropna(subset=[target["column"]])
@@ -409,11 +448,23 @@ def choose_threshold_local(y: Any, proba: Any, profit: Any, cfg: Mapping[str, An
 def paired_bootstrap_auc(
     y: Any, proba_a: Any, proba_b: Any, n_boot: int = 300, seed: int = 42
 ) -> dict[str, float]:
-    """Écart de ROC-AUC (b - a) sur la validation et son intervalle bootstrap à 95 %.
+    """Écart de ROC-AUC (b - a) et son intervalle bootstrap apparié à 95 %."""
+    return paired_bootstrap(y, proba_a, proba_b, roc_auc_score, n_boot=n_boot, seed=seed)
 
-    Les mêmes prêts sont tirés pour les deux variantes (bootstrap apparié). Ce n'est pas un
-    élément du protocole : c'est un ajout du notebook 05 pour juger si l'écart dépasse le
-    bruit d'échantillonnage de la validation.
+
+def paired_bootstrap(
+    y: Any,
+    proba_a: Any,
+    proba_b: Any,
+    metric: Callable[[Any, Any], float],
+    n_boot: int = 2000,
+    seed: int = 42,
+) -> dict[str, float]:
+    """Écart metric(b) - metric(a) sur la validation et son intervalle bootstrap à 95 %.
+
+    Les mêmes prêts sont tirés pour les deux variantes (bootstrap apparié). Les tirages qui
+    n'ont qu'une classe sont écartés. Ce n'est pas un élément du protocole : c'est un ajout
+    du notebook 05 pour juger si l'écart dépasse le bruit d'échantillonnage de la validation.
     """
     y = np.asarray(y)
     a = np.asarray(proba_a, dtype=float)
@@ -425,14 +476,39 @@ def paired_bootstrap_auc(
         idx = rng.integers(0, n, n)
         if y[idx].min() == y[idx].max():
             continue
-        diffs.append(roc_auc_score(y[idx], b[idx]) - roc_auc_score(y[idx], a[idx]))
+        diffs.append(metric(y[idx], b[idx]) - metric(y[idx], a[idx]))
     diffs = np.asarray(diffs)
     return {
-        "diff": float(roc_auc_score(y, b) - roc_auc_score(y, a)),
+        "diff": float(metric(y, b) - metric(y, a)),
         "low": float(np.quantile(diffs, 0.025)),
         "high": float(np.quantile(diffs, 0.975)),
         "n_boot": int(len(diffs)),
     }
+
+
+def rolling_origin(
+    df: pd.DataFrame, cfg: Mapping[str, Any], years: Sequence[int]
+) -> list[tuple[int, pd.DataFrame, pd.DataFrame]]:
+    """Découpages supplémentaires pour juger la stabilité d'un écart d'une année à l'autre.
+
+    Pour chaque année : entraînement du début du protocole (juin 2007) à décembre de l'année
+    précédente, validation sur l'année. Les années doivent précéder le test : 2015 n'est
+    jamais utilisée. Ce n'est pas le protocole (validation 2014 seulement) : c'est un
+    contrôle de robustesse du notebook 05, qui ne choisit rien à lui seul.
+    """
+    split = cfg["split"]
+    test_start = pd.Timestamp(split["test"]["start"])
+    date = pd.to_datetime(df[split["date_column"]]).dt.normalize()
+    if (date >= test_start).any():
+        raise ValueError("Des prêts du test sont présents : le contrôle par année les refuse.")
+    out = []
+    for year in years:
+        if year >= test_start.year:
+            raise ValueError(f"{year} n'est pas permis : le test commence en {test_start.year}.")
+        in_train = date.between(pd.Timestamp(split["train"]["start"]), pd.Timestamp(year - 1, 12, 31))
+        in_valid = date.between(pd.Timestamp(year, 1, 1), pd.Timestamp(year, 12, 31))
+        out.append((year, df[in_train].copy(), df[in_valid].copy()))
+    return out
 
 
 # ---------------------------------------------------------------------------------------
