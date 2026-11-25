@@ -12,6 +12,8 @@ import os
 import re
 import secrets
 import sys
+import threading
+import time
 import types
 from uuid import UUID, uuid4
 
@@ -100,6 +102,18 @@ def test_unknown_inference_answers_404_in_the_common_format(client, store):
         "errors": None,
     }
     assert "POST /predict" in body["detail"]
+
+
+@pytest.mark.parametrize("value", ["agree", "disagree"])
+def test_refusal_logs_do_not_contain_the_chosen_value(client, store, caplog, value):
+    with caplog.at_level(logging.INFO, logger="neuraxion"):
+        store.found = False
+        assert client.post("/feedback", json={"inference_id": INFERENCE_ID, "feedback": value}).status_code == 404
+        store.error = psycopg.OperationalError("panne")
+        assert client.post("/feedback", json={"inference_id": INFERENCE_ID, "feedback": value}).status_code == 503
+    assert "agree" not in caplog.text
+    assert "POST /feedback -> 404" in caplog.text
+    assert "POST /feedback -> 503" in caplog.text
 
 
 # --- 422 : choix fermé, sans texte libre -----------------------------------------------------
@@ -248,6 +262,10 @@ def test_other_database_error_answers_500_without_its_message(client, store, cap
 class FakeConnection:
     def __init__(self):
         self.rollbacks = 0
+        self.executed = []
+
+    def execute(self, query, parameters=None):
+        self.executed.append(query)
 
     def __enter__(self):
         return self
@@ -280,11 +298,14 @@ def fake_db(monkeypatch):
 @pytest.mark.parametrize("missing", [psycopg.errors.UndefinedColumn, psycopg.errors.UndefinedTable])
 def test_missing_column_or_table_is_created_then_written_once_more(fake_db, missing):
     fake_db.outcomes = [missing("absente"), True]
-    assert feedback.store_feedback(UUID(INFERENCE_ID), "agree") is True
+    assert feedback.store_feedback(UUID(INFERENCE_ID), "disagree") is True
+    assert [(inference_id, value) for inference_id, value, _ in fake_db.saves] == [(UUID(INFERENCE_ID), "disagree")] * 2
     assert fake_db.connection.rollbacks == 1
     assert fake_db.schemas == [fake_db.connection]
     assert len(fake_db.saves) == 2
     assert all(conn is fake_db.connection for *_, conn in fake_db.saves)
+    # L'attente de verrou est bornée dans chaque transaction, y compris après le rollback.
+    assert fake_db.connection.executed == ["SET LOCAL lock_timeout = '2s'"] * 2
 
 
 def test_schema_completion_is_tried_only_once(fake_db):
@@ -311,6 +332,15 @@ def test_first_write_is_kept_without_rollback_or_schema(fake_db, found):
     assert fake_db.connection.rollbacks == 0
     assert fake_db.schemas == []
     assert len(fake_db.saves) == 1
+    assert fake_db.connection.executed == ["SET LOCAL lock_timeout = '2s'"]
+
+
+def test_lock_wait_beyond_the_timeout_answers_503(client, store):
+    store.error = psycopg.errors.LockNotAvailable("verrou secret-7f3a")
+    response = client.post("/feedback", json={"inference_id": INFERENCE_ID, "feedback": "agree"})
+    assert response.status_code == 503
+    assert response.json()["code"] == "DATABASE_UNAVAILABLE"
+    assert "secret-7f3a" not in response.text
 
 
 # --- save_feedback ---------------------------------------------------------------------------
@@ -370,7 +400,7 @@ def test_save_feedback_refuses_other_values_before_the_database(value):
 
 def test_openapi_announces_404_422_503_and_no_longer_501(client):
     responses = client.get("/openapi.json").json()["paths"]["/feedback"]["post"]["responses"]
-    assert {"200", "404", "422", "503"} <= set(responses)
+    assert {"200", "404", "422", "500", "503"} <= set(responses)
     assert "501" not in responses
 
 
@@ -386,8 +416,8 @@ def test_schema_script_adds_the_column_idempotently_after_creating_the_table():
     # Un seul ALTER TABLE, et pas d'ADD CONSTRAINT séparé (qui échouerait au second passage).
     assert len(re.findall(r"^ALTER TABLE[^;]*;", script, re.MULTILINE)) == 1
     assert "ADD CONSTRAINT" not in script
-    # Verrou exclusif de l'ALTER TABLE borné, posé avant lui.
-    assert script.index("SET LOCAL lock_timeout") < alter.start()
+    # L'attente du verrou exclusif de l'ALTER TABLE est bornée par create_schema(), pas par le script.
+    assert "SET LOCAL" not in script
 
 
 def _doc_section() -> str:
@@ -410,6 +440,13 @@ def test_doc_lists_every_status_of_the_route(client):
     # Une inférence en erreur répond 404 NOT_FOUND, annoncé sur la ligne des erreurs et dans les puces.
     assert "enregistrée en erreur" in errors_line
     assert "elle répond 404 comme une inférence inconnue (`NOT_FOUND`)" in section
+
+
+def test_doc_gives_the_lock_timeouts_of_the_code():
+    assert feedback.FEEDBACK_LOCK_TIMEOUT == "2s"
+    assert init_db.SCHEMA_LOCK_TIMEOUT == "5s"
+    assert "attend au plus 2 s (`lock_timeout`)" in _doc_section()
+    assert "borne à 5 s l'attente de chaque verrou" in DOC_PATH.read_text(encoding="utf-8")
 
 
 def test_doc_grant_gives_exactly_the_rights_the_query_needs():
@@ -652,3 +689,67 @@ def test_pg_role_with_only_the_documented_rights_can_record_feedback(pg, monkeyp
         with connection.connect(ENVIRON) as conn:
             conn.execute(f"DROP OWNED BY {role}")
             conn.execute(f"DROP ROLE {role}")
+
+
+class LockHolder:
+    """Autre session qui garde un verrou tant que la transaction reste ouverte.
+
+    Un minuteur ferme la connexion au bout de 15 s si lock_timeout ne joue pas : le test
+    échoue alors sur la durée mesurée au lieu de rester bloqué.
+    """
+
+    def __init__(self, *queries):
+        self.conn = connection.connect(ENVIRON)
+        for query, *parameters in queries:
+            self.conn.execute(query, *parameters)
+        self.timer = threading.Timer(15, self.conn.close)
+        self.timer.start()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.timer.cancel()
+        self.conn.close()
+        return False
+
+
+@postgres
+def test_pg_create_schema_does_not_wait_more_than_its_lock_timeout(pg):
+    init_db.create_schema()
+    # Lecture restée ouverte : ACCESS SHARE, incompatible avec le verrou exclusif de l'ALTER TABLE.
+    with LockHolder(("SELECT 1 FROM inferences LIMIT 1",)):
+        started = time.monotonic()
+        with pytest.raises(psycopg.errors.LockNotAvailable):
+            init_db.create_schema()
+        elapsed = time.monotonic() - started
+    assert 4 <= elapsed < 8, elapsed
+
+
+@postgres
+def test_pg_advisory_lock_held_elsewhere_does_not_block_create_schema(pg):
+    # Une autre création bloquée garde le verrou consultatif : l'attente est bornée elle aussi.
+    with LockHolder(("SELECT pg_advisory_lock(%s)", (init_db.SCHEMA_LOCK_KEY,))):
+        started = time.monotonic()
+        with pytest.raises(psycopg.errors.LockNotAvailable):
+            init_db.create_schema()
+        elapsed = time.monotonic() - started
+    assert elapsed < 8, elapsed
+
+
+@postgres
+def test_pg_locked_row_answers_503_within_the_route_timeout_then_200(pg):
+    with TestClient(pg()) as client:
+        inference_id = client.post("/predict", json=VALID).json()["inference_id"]
+        update = ("UPDATE inferences SET feedback = 'agree' WHERE id = %s", (inference_id,))
+        with LockHolder(update):  # écriture non validée : la ligne reste verrouillée
+            started = time.monotonic()
+            locked = client.post("/feedback", json={"inference_id": inference_id, "feedback": "disagree"})
+            elapsed = time.monotonic() - started
+        assert locked.status_code == 503, locked.text
+        assert locked.json()["code"] == "DATABASE_UNAVAILABLE"
+        assert 1.5 <= elapsed < 6, elapsed
+        assert feedback_of(inference_id) is None  # l'écriture de l'autre session a été annulée
+        released = client.post("/feedback", json={"inference_id": inference_id, "feedback": "disagree"})
+    assert released.status_code == 200
+    assert feedback_of(inference_id) == "disagree"

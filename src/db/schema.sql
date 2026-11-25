@@ -5,11 +5,6 @@
 -- La colonne feedback (tâche F1) est ajoutée à la fin, par ALTER TABLE, pour compléter aussi une
 -- table créée avant F1.
 
--- ALTER TABLE prend un verrou exclusif à chaque passage, même si la colonne existe : une
--- transaction restée ouverte sur la table ne bloque pas le démarrage plus de 5 s (échec
--- journalisé, schéma retenté plus tard). SET LOCAL ne vaut que pour la transaction de create_schema().
-SET LOCAL lock_timeout = '5s';
-
 CREATE TABLE IF NOT EXISTS inferences (
     id                 uuid             PRIMARY KEY DEFAULT gen_random_uuid(),
     created_at         timestamptz      NOT NULL DEFAULT now(),
@@ -49,6 +44,8 @@ CREATE INDEX IF NOT EXISTS inferences_model_version_idx ON inferences (model_nam
 
 -- Tâche F1 : accord (agree) ou désaccord (disagree) avec la décision, NULL tant que rien n'est dit.
 -- IF NOT EXISTS rend l'instruction idempotente : si la colonne existe, la contrainte n'est pas
--- recréée non plus. Le feedback n'est jamais utilisé pour l'entraînement (décision H14).
+-- recréée non plus. L'instruction prend un verrou exclusif bref à chaque passage, même si la
+-- colonne existe : create_schema() borne son attente (lock_timeout, src/db/init_db.py).
+-- Le feedback n'est jamais utilisé pour l'entraînement (décision H14).
 ALTER TABLE inferences ADD COLUMN IF NOT EXISTS feedback text
     CONSTRAINT inferences_feedback_values CHECK (feedback IN ('agree', 'disagree'));

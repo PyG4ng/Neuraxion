@@ -951,7 +951,8 @@ def test_inference_record_refuses_impossible_values(change):
 def test_create_schema_runs_the_sql_file_under_an_advisory_lock():
     database = FakeDatabase()
     init_db.create_schema(FakeConnection(database))
-    lock, script = database.queries
+    timeout, lock, script = database.queries
+    assert timeout == "SET LOCAL lock_timeout = '5s'"  # F1 : attente bornée, avant le verrou
     assert "pg_advisory_xact_lock" in lock
     assert script == init_db.SCHEMA_PATH.read_text(encoding="utf-8")
 
@@ -1260,9 +1261,10 @@ def test_create_schema_runs_inside_its_own_transaction():
     database = FakeDatabase()
     init_db.create_schema(RecordingConnection(database))
     assert database.queries[0] == "BEGIN"
-    assert "pg_advisory_xact_lock" in database.queries[1]
-    assert database.queries[2] == init_db.SCHEMA_PATH.read_text(encoding="utf-8")
-    assert database.queries[3] == "COMMIT"
+    assert database.queries[1].startswith("SET LOCAL lock_timeout")  # F1
+    assert "pg_advisory_xact_lock" in database.queries[2]
+    assert database.queries[3] == init_db.SCHEMA_PATH.read_text(encoding="utf-8")
+    assert database.queries[4] == "COMMIT"
 
 
 # Tue M48 : une dépendance absente à l'import de R1 (mlflow) est une erreur de chargement.

@@ -38,11 +38,11 @@ DATABASE_UNAVAILABLE_DETAIL = (
 )
 
 # PostgreSQL injoignable ou non configurée : le feedback ne peut pas être enregistré.
-DATABASE_DOWN = (
-    DatabaseNotConfigured,
-    psycopg.OperationalError,
-    psycopg.InterfaceError,
-)
+# LockNotAvailable (attente de verrou dépassée) en fait partie : c'est une OperationalError.
+DATABASE_DOWN = (DatabaseNotConfigured, psycopg.OperationalError, psycopg.InterfaceError)
+# Une ligne verrouillée par une autre transaction ne bloque pas la route (ni le pool de fils)
+# plus longtemps : au-delà, 503.
+FEEDBACK_LOCK_TIMEOUT = "2s"
 
 router = APIRouter(tags=["inférence"])
 
@@ -53,17 +53,24 @@ def store_feedback(inference_id: UUID, value: FeedbackValue) -> bool:
     Si la table ou la colonne feedback manque (base créée avant F1 et absente au démarrage,
     table supprimée depuis), le schéma est complété puis l'écriture est retentée une fois.
     Compléter le schéma demande d'être propriétaire de la table : avec les seuls droits de la
-    route, create_schema() lève InsufficientPrivilege (réponse 500).
+    route, create_schema() lève InsufficientPrivilege (réponse 500). L'attente d'une ligne
+    verrouillée est bornée à FEEDBACK_LOCK_TIMEOUT (LockNotAvailable, réponse 503).
 
     Lève DatabaseNotConfigured ou psycopg.Error.
     """
     with connect() as connection:
         try:
-            return save_feedback(inference_id, value, connection)
+            return _write(connection, inference_id, value)
         except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn):
             connection.rollback()
             create_schema(connection)
-            return save_feedback(inference_id, value, connection)
+            return _write(connection, inference_id, value)
+
+
+def _write(connection: psycopg.Connection, inference_id: UUID, value: FeedbackValue) -> bool:
+    # SET LOCAL vaut pour la transaction ouverte par cette instruction, jusqu'au commit.
+    connection.execute(f"SET LOCAL lock_timeout = '{FEEDBACK_LOCK_TIMEOUT}'")
+    return save_feedback(inference_id, value, connection)
 
 
 @router.post(
@@ -78,7 +85,11 @@ def store_feedback(inference_id: UUID, value: FeedbackValue) -> bool:
             "model": ErrorResponse,
             "description": "Valeur de feedback non permise, ou identifiant mal formé.",
         },
-        503: {"model": ErrorResponse, "description": "Base de données indisponible."},
+        500: {
+            "model": ErrorResponse,
+            "description": "Colonne feedback absente et rôle sans droit pour la créer, ou erreur imprévue.",
+        },
+        503: {"model": ErrorResponse, "description": "Base de données indisponible ou ligne verrouillée."},
     },
     summary="Indiquer si l'on est d'accord avec la décision d'une inférence",
 )
@@ -88,7 +99,8 @@ def feedback(payload: FeedbackRequest) -> FeedbackResponse:
         found = store_feedback(payload.inference_id, payload.feedback)
     except DATABASE_DOWN as error:
         logger.error(
-            "Feedback de l'inférence %s non enregistré : PostgreSQL injoignable ou non configurée (%s). Réponse 503.",
+            "Feedback de l'inférence %s non enregistré : base injoignable, non configurée ou ligne verrouillée (%s). "
+            "Réponse 503.",
             payload.inference_id,
             type(error).__name__,
         )
