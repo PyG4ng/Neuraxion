@@ -3,7 +3,7 @@
 Aucun test de ce fichier ne demande PostgreSQL ni MLflow : la base est remplacée par une
 fausse connexion qui garde les requêtes SQL reçues, et le @champion par un faux module
 src.registry.champion (l'interface de R1, issue #8). Les tests contre un vrai PostgreSQL
-sont dans test_predict_postgres.py.
+sont dans tests/db/test_predict_postgres.py.
 """
 
 import json

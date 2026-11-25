@@ -1,8 +1,8 @@
 """Configuration commune des tests du lot P4 (dossier tests/api).
 
 Les tests ne contactent jamais de vraie base : les variables POSTGRES_* de la machine sont
-retirées de l'environnement pendant chaque test. Les tests contre un PostgreSQL réel
-(tests/api/test_predict_postgres.py) lisent leur propre configuration, NEURAXION_TEST_POSTGRES_*.
+retirées de l'environnement pendant chaque test. Les tests contre un PostgreSQL réel sont dans
+tests/db (A2 et A4), qui lit ces variables.
 Le module src.registry.champion est remplacé par un faux qui ne renvoie aucun champion.
 """
 

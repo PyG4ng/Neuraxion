@@ -482,6 +482,54 @@ ORDER BY created_at DESC
 LIMIT 5;
 ```
 
+## Tests de l'API et de la base (A4)
+
+Deux dossiers :
+
+- `tests/api` : l'API sans base ni MLflow (fausses connexions, faux `@champion`, fausse `train_and_promote`). Les variables `POSTGRES_*` y sont retirées pendant chaque test ;
+- `tests/db` : l'application complète contre un vrai PostgreSQL, configuré par les variables `POSTGRES_*` (`src/db/connection.py`).
+
+Sans base, les tests de `tests/db` sont sautés :
+
+```bash
+uv run pytest tests/api tests/db
+```
+
+Résultat attendu : 511 tests réussis et 19 sautés.
+
+Avec le PostgreSQL de Compose (depuis la racine du dépôt, `.env.production` rempli) :
+
+```bash
+docker compose up -d --wait postgres
+POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=5433 uv run --env-file .env.production pytest tests/api tests/db
+```
+
+Sous PowerShell :
+
+```powershell
+docker compose up -d --wait postgres
+$env:POSTGRES_HOST = "127.0.0.1"; $env:POSTGRES_PORT = "5433"
+uv run --env-file .env.production pytest tests/api tests/db
+```
+
+Résultat attendu : 530 tests réussis, aucun sauté. `uv run --env-file` lit l'utilisateur, le mot de passe et la base dans `.env.production` ; les variables déjà posées dans le terminal passent avant celles du fichier, si bien que `POSTGRES_HOST=postgres` et `POSTGRES_PORT=5432`, valables entre conteneurs, sont remplacés par l'adresse vue depuis la machine. Écrire `127.0.0.1` plutôt que `localhost` : sous Windows, `localhost` essaie d'abord `::1`, où Compose ne publie pas le port, et chaque connexion perd alors 2 s (`GET /health` répond `degraded`).
+
+Règles de `tests/db/conftest.py` :
+
+- sans `POSTGRES_USER`, `POSTGRES_PASSWORD` ou `POSTGRES_DB`, chaque test est sauté et le motif le dit ;
+- base configurée mais injoignable : chaque test échoue, avec le type de l'erreur et l'adresse à vérifier, pour qu'une base arrêtée ne passe pas pour un succès ;
+- chaque test travaille dans un schéma temporaire `neuraxion_test_...`, supprimé à la fin. `PGOPTIONS` le place seul dans le `search_path` de toutes les connexions du processus : la table `inferences` du schéma `public`, donc l'historique de la base de Compose, n'est ni lue ni modifiée (un test le vérifie) ;
+- un test crée un rôle temporaire `neuraxion_api_limitee_...`, qui a seulement le droit d'insérer, puis le supprime. L'utilisateur de `.env.production` doit donc pouvoir créer un schéma et un rôle, ce qui est le cas de l'utilisateur créé par l'image `postgres` ;
+- le `@champion` (R1) est remplacé par un faux module `src.registry.champion`, et `train_and_promote` (R2) par une fausse fonction : ni MLflow ni entraînement réel.
+
+Vérifications du §13 et de l'issue #22 :
+
+| Vérification | Sans base (`tests/api`) | Avec PostgreSQL (`tests/db`) |
+|---|---|---|
+| §13 n° 3 : `POST /predict` avec une entrée valide et une entrée invalide | `test_predict.py` (`test_prediction_returns_a_decision_and_records_one_row_with_the_version`, `test_unknown_fields_are_refused_and_not_recorded`, `test_validation_errors_are_not_recorded`) | `test_api_postgres.py::test_valid_then_invalid_request_and_the_documented_query` |
+| §13 n° 4 et critère I : une prédiction réussie est enregistrée avec la version du modèle | `test_predict.py` (même test, sur une fausse connexion) | `test_predict_postgres.py::test_prediction_creates_a_row_with_the_version` ; `test_api_postgres.py` : requête SQL de la section « Table inferences », version après une promotion, lignes gardées après un redémarrage |
+| `POST /train` sans clé et avec une mauvaise clé | `test_train.py` (`test_without_header_answers_401_in_the_common_format`, `test_a_wrong_key_answers_403`) | `test_api_postgres.py::test_train_without_key_or_with_a_wrong_key_changes_nothing` : 401 ou 403, ni entraînement, ni rechargement, ni ligne en base |
+
 ## Points à confirmer à la revue des contrats (C6)
 
 - Le format de `contracts/features.yaml` (lot P1). `build_request_model()` suppose pour chaque variable : `name` et `type` (`numeric`, `integer` ou `categorical`) obligatoires ; `min`, `max`, `allowed`, `required` (vrai par défaut), `label`, `unit` et `example` facultatifs.
