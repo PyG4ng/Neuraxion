@@ -30,6 +30,7 @@ import os
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any
 
 import numpy as np
@@ -67,6 +68,38 @@ OUTPUT_SHAPE = "predict_proba doit renvoyer une ligne par demande et deux colonn
 OUTPUT_NOT_REAL = "La probabilité renvoyée par le modèle n'est pas un nombre réel."
 OUTPUT_RANGE = "La probabilité renvoyée par le modèle n'est pas entre 0 et 1."
 OUTPUT_PROBLEMS = (OUTPUT_SHAPE, OUTPUT_NOT_REAL, OUTPUT_RANGE)
+
+# Nom de type gardé dans error_message et les logs : un identifiant Python court, sinon générique.
+TYPE_NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+GENERIC_ERROR_TYPE = "exception"
+
+
+def error_type_name(error: BaseException) -> str:
+    """Nom du type d'une exception, ou « exception » s'il n'est pas un identifiant court.
+
+    Le nom d'une classe est choisi par le code qui la définit (le modèle, R1) : un texte libre
+    n'entre ni dans error_message ni dans les logs.
+    """
+    name = type(error).__name__
+    return name if TYPE_NAME_PATTERN.fullmatch(name) else GENERIC_ERROR_TYPE
+
+
+def _real_scores(scores: np.ndarray) -> np.ndarray:
+    """Tableau de réels : un tableau object fait de réels (Decimal compris) est converti."""
+    if scores.dtype == object:
+        if not all(
+            isinstance(value, numbers.Real | Decimal) and not isinstance(value, bool | np.bool_)
+            for value in scores.flat
+        ):
+            raise ModelOutputError(OUTPUT_NOT_REAL)
+        try:
+            scores = scores.astype("float64")
+        except (TypeError, ValueError, OverflowError, ArithmeticError):
+            raise ModelOutputError(OUTPUT_NOT_REAL) from None
+    # Réels seulement : un complexe perdrait sa partie imaginaire, un booléen n'est pas une probabilité.
+    if scores.dtype.kind not in "fiu":
+        raise ModelOutputError(OUTPUT_NOT_REAL)
+    return scores
 
 
 @dataclass(frozen=True)
@@ -110,16 +143,14 @@ class ServedChampion:
         try:
             raw = self.model.predict_proba(frame)
         except Exception as error:  # noqa: BLE001 - seul le type est gardé, jamais le message
-            raise ModelFailure(type(error).__name__) from None
+            raise ModelFailure(error_type_name(error)) from None
         try:
             scores = np.asarray(raw)
         except Exception:  # noqa: BLE001 - sortie que numpy ne sait pas lire
             raise ModelOutputError(OUTPUT_NOT_REAL) from None
         if scores.shape != (1, 2):
             raise ModelOutputError(OUTPUT_SHAPE)
-        # Réels seulement : un complexe perdrait sa partie imaginaire, un booléen n'est pas une probabilité.
-        if scores.dtype.kind not in "fiu":
-            raise ModelOutputError(OUTPUT_NOT_REAL)
+        scores = _real_scores(scores)
         value = float(scores[0, self.positive_column])
         if not math.isfinite(value) or not 0 <= value <= 1:
             raise ModelOutputError(OUTPUT_RANGE)
@@ -263,4 +294,4 @@ def adapt_champion(
     except ChampionError:
         raise
     except Exception as error:  # noqa: BLE001 - résultat de R1 inexploitable : seul le type est gardé
-        raise ChampionError(f"Résultat de load_champion() inexploitable ({type(error).__name__}).") from None
+        raise ChampionError(f"Résultat de load_champion() inexploitable ({error_type_name(error)}).") from None

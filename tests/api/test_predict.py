@@ -13,6 +13,7 @@ import re
 import sys
 import types
 from datetime import datetime
+from decimal import Decimal
 from uuid import UUID
 
 import numpy as np
@@ -1266,3 +1267,104 @@ def test_missing_dependency_at_registry_import_is_a_load_error(make_app, databas
             assert client.post("/predict", json=VALID).status_code == 503
     assert "Chargement du @champion impossible (ModuleNotFoundError)" in caplog.text
     assert "introuvable" not in caplog.text
+
+
+# Boucle 3 : filet de adapt_champion, noms de type libres, sorties object.
+
+
+class ChampionWithBrokenModel:
+    """Champion dont l'attribut model lève une exception ordinaire (pas une ChampionError)."""
+
+    version = "4"
+    decision_threshold = 0.31
+    features = list(FEATURES)
+
+    @property
+    def model(self):
+        raise RuntimeError(f"panne {SECRET}")
+
+
+def test_unexpected_error_while_adapting_the_champion_stops_serving(make_app, database, monkeypatch, caplog):
+    registry = Registry(monkeypatch, champion(version="3"))
+    with TestClient(make_app()) as client:
+        registry.current = ChampionWithBrokenModel()
+        with caplog.at_level(logging.WARNING, logger="neuraxion"):
+            assert client.app.state.reload_model() is None
+        assert client.post("/predict", json=VALID).status_code == 503
+        assert client.get("/health").json()["model"] is None
+    assert "Résultat de load_champion() inexploitable (RuntimeError)" in caplog.text
+    assert SECRET not in caplog.text
+
+
+def test_unexpected_error_while_adapting_the_champion_does_not_block_startup(make_app, database, monkeypatch, caplog):
+    Registry(monkeypatch, ChampionWithBrokenModel())
+    with caplog.at_level(logging.WARNING, logger="neuraxion"):
+        with TestClient(make_app()) as client:
+            assert client.get("/health").json()["model"] is None
+            assert client.post("/predict", json=VALID).status_code == 503
+    assert "inexploitable (RuntimeError)" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("ValueError", "ValueError"),
+        ("_Prive2", "_Prive2"),
+        ("x" * 64, "x" * 64),
+        ("x" * 65, "exception"),
+        ("Nom libre TEMOIN", "exception"),
+        ("9Debut", "exception"),
+        ("Accentué", "exception"),
+        ("Fin\n", "exception"),
+    ],
+)
+def test_error_type_name_keeps_only_short_identifiers(name, expected):
+    error = type(name, (Exception,), {})()
+    assert served_model.error_type_name(error) == expected
+
+
+def test_free_exception_class_name_never_reaches_the_database_or_logs(make_app, database, monkeypatch, caplog):
+    witness = f"Nom libre {SECRET}"
+    Registry(monkeypatch, champion(FakeModel(error=type(witness, (Exception,), {})())))
+    with caplog.at_level(logging.DEBUG, logger="neuraxion"):
+        with TestClient(make_app()) as client:
+            assert client.post("/predict", json=VALID).status_code == 500
+    (row,) = database.rows
+    assert row["error_message"] == "Le modèle a échoué pendant la prédiction (exception)."
+    assert SECRET not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        np.array([[0.6, 0.4]], dtype=object),
+        np.array([[Decimal("0.6"), Decimal("0.4")]], dtype=object),
+        np.array([[0.6, np.float32(0.4)]], dtype=object),
+    ],
+)
+def test_object_output_made_of_reals_is_converted(make_app, database, monkeypatch, output):
+    Registry(monkeypatch, champion(FakeModel(lambda frame: output)))
+    with TestClient(make_app()) as client:
+        response = client.post("/predict", json=VALID)
+    assert response.status_code == 200
+    assert response.json()["default_probability"] == pytest.approx(0.4)
+    assert database.rows[0]["status"] == "success"
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        np.array([[False, True]], dtype=object),
+        np.array([[0.6, np.bool_(True)]], dtype=object),
+        np.array([[0.6, None]], dtype=object),
+        np.array([[0.6, "0.4"]], dtype=object),
+        np.array([[0.6, 0.4j]], dtype=object),
+        np.array([[0.6, Decimal("NaN")]], dtype=object),
+        np.array([[0.6, Decimal("1e400")]], dtype=object),
+    ],
+)
+def test_object_output_with_a_non_real_value_is_refused(make_app, database, monkeypatch, output):
+    Registry(monkeypatch, champion(FakeModel(lambda frame: output)))
+    with TestClient(make_app()) as client:
+        assert client.post("/predict", json=VALID).status_code == 500
+    assert database.rows[0]["error_message"].startswith("Sortie du modèle inexploitable")

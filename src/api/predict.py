@@ -149,7 +149,7 @@ def _make_reloader(app: FastAPI, features: tuple[str, ...], categorical: frozens
         except Exception as error:  # noqa: BLE001 - MLflow, R1 : l'API reste debout
             # Exception levée par load_champion() lui-même, de quelque type qu'elle soit : panne
             # passagère possible, l'ancien modèle est gardé. Seul le type est journalisé.
-            logger.warning("Chargement du @champion impossible (%s). %s", type(error).__name__, _kept(current))
+            logger.warning("Chargement du @champion impossible (%s). %s", served_model.error_type_name(error), _kept(current))
             return current
         try:
             served = served_model.adapt_champion(champion, features, categorical)
@@ -228,7 +228,10 @@ def build_router(request_model: type[BaseModel]) -> APIRouter:
                 cause = MODEL_OUTPUT_CAUSE.format(reason=error)
                 error_type = "sortie inexploitable"
             else:
-                error_type = error.error_type if isinstance(error, served_model.ModelFailure) else type(error).__name__
+                if isinstance(error, served_model.ModelFailure):
+                    error_type = error.error_type
+                else:
+                    error_type = served_model.error_type_name(error)
                 cause = MODEL_FAILURE_CAUSE.format(error_type=error_type)
             logger.error(
                 "Inférence %s : le modèle %s version %s a échoué (%s).",
