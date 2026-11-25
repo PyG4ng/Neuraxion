@@ -26,15 +26,20 @@ def connection_params(environ: Mapping[str, str] | None = None) -> dict[str, str
     postgres et 5432 ; depuis la machine hôte, localhost et 5433.
 
     Lève
-        DatabaseNotConfigured si POSTGRES_USER, POSTGRES_PASSWORD ou POSTGRES_DB est vide.
+        DatabaseNotConfigured si POSTGRES_USER, POSTGRES_PASSWORD ou POSTGRES_DB est vide, ou si
+        POSTGRES_PORT n'est pas un entier.
     """
     environ = os.environ if environ is None else environ
     missing = [name for name in REQUIRED_VARIABLES if not environ.get(name)]
     if missing:
         raise DatabaseNotConfigured(f"Variables PostgreSQL non renseignées : {', '.join(missing)}.")
+    try:
+        port = int(environ.get("POSTGRES_PORT") or 5432)
+    except ValueError:
+        raise DatabaseNotConfigured("POSTGRES_PORT doit être un entier.") from None
     return {
         "host": environ.get("POSTGRES_HOST") or "localhost",
-        "port": int(environ.get("POSTGRES_PORT") or 5432),
+        "port": port,
         "dbname": environ["POSTGRES_DB"],
         "user": environ["POSTGRES_USER"],
         "password": environ["POSTGRES_PASSWORD"],
