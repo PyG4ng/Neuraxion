@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from src.api import main, schemas, security, train
+from src.api import main, predict, schemas, security, train
 
 CONTRACT = {
     "version": "test-a3",
@@ -666,3 +666,55 @@ def test_an_empty_key_is_refused_with_401_in_a_direct_call():
         security.require_api_key(request, "")
     assert raised.value.status_code == 401
 
+
+# --- de bout en bout : vrai reload_model de A2, faux champion et fausse train_and_promote ---
+
+
+class ChampionModel:
+    """Modèle factice servi par le vrai adaptateur de A2 : probabilité fixe."""
+
+    classes_ = [0, 1]
+
+    def __init__(self, probability):
+        self.probability = probability
+
+    def predict_proba(self, frame):
+        return [[1 - self.probability, self.probability]]
+
+
+def test_a_promotion_makes_predict_serve_the_new_version(app, monkeypatch):
+    # Faux registre MLflow (interface R1) : version 3, puis version 4 après la promotion.
+    registry = {"version": "3", "loads": 0}
+
+    def load_champion():
+        registry["loads"] += 1
+        return {
+            "model": ChampionModel(0.2 if registry["version"] == "3" else 0.6),
+            "name": "credit-default",
+            "version": registry["version"],
+            "decision_threshold": 0.31 if registry["version"] == "3" else 0.29,
+            "features": [feature["name"] for feature in CONTRACT["features"]],
+        }
+
+    module = types.ModuleType("src.registry.champion")
+    module.load_champion = load_champion
+    monkeypatch.setitem(sys.modules, "src.registry.champion", module)
+    stored = []
+    monkeypatch.setattr(predict, "store_inference", stored.append)
+
+    def train_and_promote(preset):
+        registry["version"] = "4"
+        return PROMOTED
+
+    use(app, train_and_promote)
+    request = EXAMPLES["prudent"]
+    with TestClient(app) as client:
+        assert registry["loads"] == 1
+        before = client.post("/predict", json=request).json()
+        assert (before["model_version"], before["decision"]) == ("3", "approve")
+        assert post(client).json()["model_version"] == "4"
+        assert registry["loads"] == 2
+        after = client.post("/predict", json=request).json()
+        assert (after["model_version"], after["decision_threshold"], after["decision"]) == ("4", 0.29, "reject")
+        assert client.get("/health").json()["model"]["version"] == "4"
+    assert [record.model_version for record in stored] == ["3", "4"]
