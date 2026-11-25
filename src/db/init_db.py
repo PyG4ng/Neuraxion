@@ -39,9 +39,15 @@ def create_schema(connection: psycopg.Connection | None = None) -> None:
         connection : connexion ouverte à réutiliser ; sans elle, une connexion est ouverte à
             partir des variables POSTGRES_* puis refermée.
 
+    Précondition : une connexion fournie n'a pas de transaction ouverte (au repos, ou juste
+        après rollback()). Sinon transaction() ne crée qu'un point de sauvegarde, et
+        lock_timeout comme le verrou consultatif durent jusqu'à la fin de la transaction de
+        l'appelant.
+
     Lève
         DatabaseNotConfigured si les variables de connexion manquent, psycopg.Error si
-        PostgreSQL ne répond pas ou refuse le script.
+        PostgreSQL ne répond pas ou refuse le script (LockNotAvailable si un verrou n'est pas
+        obtenu en SCHEMA_LOCK_TIMEOUT).
     """
     script = SCHEMA_PATH.read_text(encoding="utf-8")
     if connection is None:

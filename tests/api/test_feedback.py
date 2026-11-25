@@ -439,6 +439,7 @@ def test_doc_lists_every_status_of_the_route(client):
         assert status in errors_line, status
     # Une inférence en erreur répond 404 NOT_FOUND, annoncé sur la ligne des erreurs et dans les puces.
     assert "enregistrée en erreur" in errors_line
+    assert "409" not in section  # pas de conflit : une inférence sans décision répond 404
     assert "elle répond 404 comme une inférence inconnue (`NOT_FOUND`)" in section
 
 
@@ -734,7 +735,7 @@ def test_pg_advisory_lock_held_elsewhere_does_not_block_create_schema(pg):
         with pytest.raises(psycopg.errors.LockNotAvailable):
             init_db.create_schema()
         elapsed = time.monotonic() - started
-    assert elapsed < 8, elapsed
+    assert 4 <= elapsed < 8, elapsed
 
 
 @postgres

@@ -37,7 +37,7 @@ DATABASE_UNAVAILABLE_DETAIL = (
     "La base de données ne répond pas : le feedback n'a pas été enregistré. Réessayez dans quelques instants."
 )
 
-# PostgreSQL injoignable ou non configurée : le feedback ne peut pas être enregistré.
+# Base injoignable ou non configurée, ou verrou non obtenu : le feedback n'est pas enregistré.
 # LockNotAvailable (attente de verrou dépassée) en fait partie : c'est une OperationalError.
 DATABASE_DOWN = (DatabaseNotConfigured, psycopg.OperationalError, psycopg.InterfaceError)
 # Une ligne verrouillée par une autre transaction ne bloque pas la route (ni le pool de fils)
@@ -99,7 +99,7 @@ def feedback(payload: FeedbackRequest) -> FeedbackResponse:
         found = store_feedback(payload.inference_id, payload.feedback)
     except DATABASE_DOWN as error:
         logger.error(
-            "Feedback de l'inférence %s non enregistré : base injoignable, non configurée ou ligne verrouillée (%s). "
+            "Feedback de l'inférence %s non enregistré : base injoignable, non configurée ou verrou non obtenu (%s). "
             "Réponse 503.",
             payload.inference_id,
             type(error).__name__,
