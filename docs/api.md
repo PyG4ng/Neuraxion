@@ -535,7 +535,7 @@ $env:POSTGRES_HOST = "127.0.0.1"; $env:POSTGRES_PORT = "5433"
 uv run --env-file .env.production pytest tests/api tests/db
 ```
 
-Résultat attendu : 606 tests réussis, aucun sauté. Les trois tests d'attente de verrou de `test_feedback_postgres.py` durent chacun de 2 à 5 s.
+Résultat attendu : 606 tests réussis, aucun sauté. Les trois tests d'attente de verrou de `test_feedback_postgres.py` durent environ 5 s, 5 s et 2 s (délais de `lock_timeout`).
 
 Pour séparer tout à fait les tests de l'historique, on peut aussi les lancer sur une base dédiée du même serveur, créée une fois : `docker compose exec postgres createdb -U neuraxion neuraxion_test` (l'utilisateur est celui de `.env.production`), puis ajouter `POSTGRES_DB=neuraxion_test` devant la commande ci-dessus. `uv run --env-file` lit l'utilisateur, le mot de passe et la base dans `.env.production` ; les variables déjà posées dans le terminal passent avant celles du fichier, si bien que `POSTGRES_HOST=postgres` et `POSTGRES_PORT=5432`, valables entre conteneurs, sont remplacés par l'adresse vue depuis la machine. Écrire `127.0.0.1` plutôt que `localhost` : sous Windows, `localhost` essaie d'abord `::1`, où Compose ne publie pas le port, et chaque connexion perd alors 2 s (`GET /health` répond `degraded`).
 
@@ -545,10 +545,10 @@ Règles de `tests/db/conftest.py` :
 - `POSTGRES_PORT` qui n'est pas un entier, ou base configurée mais injoignable : chaque test échoue, avec le type de l'erreur et l'adresse à vérifier, pour qu'une base arrêtée ne passe pas pour un succès ;
 - chaque test travaille dans un schéma temporaire `neuraxion_test_...`, supprimé à la fin. `PGOPTIONS` le place seul dans le `search_path` de toutes les connexions du processus : les connexions ouvertes par l'API et par les tests n'écrivent pas dans la table `inferences` du schéma `public`, qui garde l'historique de la base de Compose (un test le vérifie). Un code qui changerait lui-même son `search_path` échapperait à cette protection : `src/` n'en contient aucun. `PGSERVICE` et `PGSERVICEFILE` sont retirés, car un fichier de service passerait avant `PGOPTIONS`. Avant chaque test, la fixture vérifie que `current_schema()` est bien le schéma temporaire, et sinon échoue sans lancer le test ;
 - un processus tué en plein test (Ctrl+C répété, coupure) peut laisser un schéma `neuraxion_test_...`. Pour les lister, quand aucun test ne tourne : `SELECT nspname FROM pg_namespace WHERE nspname LIKE 'neuraxion\_test\_%';`, puis `DROP SCHEMA <nom> CASCADE;` pour chacun ;
-- des tests créent des rôles temporaires, puis les suppriment : `neuraxion_api_limitee_...`, qui a seulement le droit d'insérer, et `neuraxion_feedback_limitee_...`, qui a seulement le `GRANT` de `POST /feedback`. Leurs droits portent sur le schéma de test, jamais sur `public`. L'utilisateur de `.env.production` doit donc pouvoir créer un schéma et un rôle, ce qui est le cas de l'utilisateur créé par l'image `postgres` ;
+- des tests créent des rôles temporaires, puis les suppriment : `neuraxion_api_limitee_...`, qui a seulement le droit d'insérer, et `neuraxion_feedback_limitee_...`, qui a seulement `USAGE` sur le schéma de test et le `GRANT` de `POST /feedback`. Leurs droits portent sur le schéma de test, jamais sur `public`. L'utilisateur de `.env.production` doit donc pouvoir créer un schéma et un rôle, ce qui est le cas de l'utilisateur créé par l'image `postgres` ;
 - le `@champion` (R1) est remplacé par un faux module `src.registry.champion`, et `train_and_promote` (R2) par une fausse fonction : ni MLflow ni entraînement réel.
 
-Vérifications du §13 et de l'issue #22 :
+Vérifications du §13, de l'issue #22 et de F1 (#38) :
 
 | Vérification | Sans base (`tests/api`) | Avec PostgreSQL (`tests/db`) |
 |---|---|---|

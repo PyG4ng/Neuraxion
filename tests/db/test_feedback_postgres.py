@@ -54,6 +54,16 @@ def predict(client, valid_request) -> str:
     return response.json()["inference_id"]
 
 
+@pytest.fixture(autouse=True)
+def private_schema_lock_key(monkeypatch):
+    """Clé du verrou consultatif propre à chaque test.
+
+    La clé de init_db vaut pour toute la base : un test qui la garde 5 s gênerait un autre
+    lancement de tests/db (ou une API) sur la même base.
+    """
+    monkeypatch.setattr(init_db, "SCHEMA_LOCK_KEY", secrets.randbelow(2**62) + 1)
+
+
 @pytest.fixture
 def served(registry):
     """Un @champion servi : POST /predict répond 200."""
@@ -217,7 +227,13 @@ def test_role_with_only_the_documented_rights_can_record_feedback(
             "SELECT has_table_privilege(%s, 'inferences', 'UPDATE'), has_table_privilege(%s, 'inferences', 'INSERT')",
             (role, role),
         ).fetchone()
+        columns = conn.execute(
+            "SELECT column_name, privilege_type FROM information_schema.column_privileges "
+            "WHERE grantee = %s AND table_schema = current_schema() AND table_name = 'inferences'",
+            (role,),
+        ).fetchall()
     assert rights == (False, False)  # droits sur des colonnes seulement, aucun droit sur la table entière
+    assert set(columns) == {("id", "SELECT"), ("status", "SELECT"), ("feedback", "UPDATE")}
     monkeypatch.setenv("POSTGRES_USER", role)
     monkeypatch.setenv("POSTGRES_PASSWORD", password)
     with TestClient(make_app()) as client:
@@ -258,7 +274,7 @@ def test_create_schema_does_not_wait_more_than_its_lock_timeout(database):
         with pytest.raises(psycopg.errors.LockNotAvailable):
             init_db.create_schema()
         elapsed = time.monotonic() - started
-    assert 4 <= elapsed < 8, elapsed
+    assert 4.5 <= elapsed < 6.5, elapsed  # lock_timeout de 5 s
 
 
 def test_advisory_lock_held_elsewhere_does_not_block_create_schema(database):
@@ -268,7 +284,7 @@ def test_advisory_lock_held_elsewhere_does_not_block_create_schema(database):
         with pytest.raises(psycopg.errors.LockNotAvailable):
             init_db.create_schema()
         elapsed = time.monotonic() - started
-    assert 4 <= elapsed < 8, elapsed
+    assert 4.5 <= elapsed < 6.5, elapsed  # lock_timeout de 5 s
 
 
 def test_locked_row_answers_503_within_the_route_timeout_then_200(make_app, served, database, valid_request):
@@ -281,7 +297,7 @@ def test_locked_row_answers_503_within_the_route_timeout_then_200(make_app, serv
             elapsed = time.monotonic() - started
         assert locked.status_code == 503, locked.text
         assert locked.json()["code"] == "DATABASE_UNAVAILABLE"
-        assert 1.5 <= elapsed < 6, elapsed
+        assert 1.8 <= elapsed < 3.5, elapsed  # lock_timeout de 2 s de la route
         assert feedback_of(database, inference_id) is None  # l'écriture de l'autre session a été annulée
         released = client.post("/feedback", json={"inference_id": inference_id, "feedback": "disagree"})
     assert released.status_code == 200
