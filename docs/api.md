@@ -9,7 +9,7 @@ Chaque exemple JSON précédé d'un commentaire `exemple` est vérifié par `tes
 | Route | Rôle | Tâche qui l'implémente | Réponse actuelle |
 |---|---|---|---|
 | `POST /predict` | prédire le risque de défaut d'une demande | A2 | 200 |
-| `POST /train` | entraîner, puis promouvoir si le seuil est atteint | A3 | 501 |
+| `POST /train` | entraîner, puis promouvoir si le seuil est atteint | A3 | 200 (501 tant que R2 n'est pas livrée) |
 | `GET /health` | état de l'API, de la base et du modèle | A1 | 200 |
 | `GET /schema` | contrat de données pour le formulaire | A1 | 200 |
 | `POST /feedback` | accord ou désaccord avec une décision (facultatif) | F1 | 501 |
@@ -198,7 +198,7 @@ Si la base ne répond pas pendant l'enregistrement d'une inférence en erreur, l
 
 ## POST /train
 
-Protégée par l'en-tête `X-API-Key`, comparé à `TRAIN_API_KEY`. La clé n'apparaît jamais dans les logs. Le corps choisit un préréglage de `config/training.yaml` ; sans corps, ou sans `preset`, c'est `default`.
+Protégée par l'en-tête `X-API-Key`, comparé à la variable d'environnement `TRAIN_API_KEY` du backend (`.env.example`). La clé n'apparaît jamais dans les logs ni dans les réponses. Le corps choisit un préréglage de `config/training.yaml` ; sans corps, ou sans `preset`, c'est `default`. La réponse arrive à la fin de l'entraînement : avec `curl`, ne pas fixer de délai maximal trop court.
 
 Requête complète, avec une clé fictive :
 
@@ -256,7 +256,57 @@ La décision de promotion est prise par `should_promote()` (lot P3) : pour la RO
 - `status` vaut `promoted` si et seulement si `promoted` est vrai ;
 - `model_version` est renseigné si et seulement si le modèle est promu, et c'est alors un entier écrit en texte.
 
-Erreurs propres à la route : 401 sans clé, 403 avec une mauvaise clé ou une clé non configurée, 409 si un entraînement est en cours, 422 pour un préréglage inconnu.
+### Contrôles et erreurs (A3)
+
+Le code est dans `src/api/train.py` et `src/api/security.py`. Les contrôles se font dans cet ordre, et le premier qui échoue donne la réponse :
+
+| Ordre | Contrôle | Réponse si refus |
+|---|---|---|
+| 1 | en-tête `X-API-Key` présent et non vide | 401 `UNAUTHORIZED`, avec l'en-tête `WWW-Authenticate: APIKey` |
+| 2 | clé égale à `TRAIN_API_KEY` | 403 `FORBIDDEN`, avec le même message si la clé est fausse ou si `TRAIN_API_KEY` est absente ou vide sur le serveur (la route reste alors fermée) |
+| 3 | `train_and_promote` disponible (tâche R2) | 501 `NOT_IMPLEMENTED`, qui nomme R2 et `src/registry/promotion.py` |
+| 4 | préréglage connu | 422 `VALIDATION_ERROR` sur le champ `preset` |
+| 5 | aucun entraînement en cours | 409 `TRAINING_IN_PROGRESS` |
+
+La clé est vérifiée avant le corps : un client sans la bonne clé ne reçoit que 401 ou 403, quel que soit le préréglage. Seuls les corps que FastAPI ou le middleware de A1 refusent avant la lecture des en-têtes de sécurité y échappent : JSON mal formé (422, sur le champ `corps`), UTF-8 invalide ou JSON trop imbriqué (400) et corps de plus de 64 Ko (413). Ces réponses ne disent rien de la clé ni du préréglage. Plusieurs en-têtes `X-API-Key` dans la même requête sont refusés (403), même si le premier est vide, puisque seul le premier serait lu. Les espaces autour de `TRAIN_API_KEY` sont ignorés ; une clé non ASCII doit être envoyée en UTF-8. La comparaison se fait à temps constant (`hmac.compare_digest` sur les empreintes SHA-256 des deux clés) : sa durée ne dépend ni du nombre de caractères justes ni de la longueur de la clé attendue. Les logs disent seulement pourquoi la requête est refusée (en-tête absent, plusieurs en-têtes, clé fausse, `TRAIN_API_KEY` non configurée). La route ne limite pas le nombre de tentatives : la clé doit donc être longue et tirée au hasard, par exemple avec `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
+
+Un seul entraînement à la fois : la route prend un verrou sans attendre, et une requête qui arrive pendant un entraînement reçoit aussitôt :
+
+<!-- exemple: ErrorResponse -->
+```json
+{
+  "detail": "Un entraînement est déjà en cours. Réessayez quand il sera terminé.",
+  "code": "TRAINING_IN_PROGRESS",
+  "errors": null
+}
+```
+
+Le verrou est libéré à la fin de l'entraînement, qu'il réussisse ou échoue, même si le client s'est déconnecté entre-temps. Il vaut pour un processus : l'API doit tourner avec un seul processus uvicorn (sans `--workers`), point à reprendre dans la commande de démarrage du backend (tâche I1). La route est synchrone : FastAPI l'exécute dans un fil, si bien que `/health`, `/schema` et `/predict` continuent de répondre pendant l'entraînement.
+
+Une exception levée par `train_and_promote` ou à l'import de son module, `sys.exit()` et toute autre `BaseException` compris, donne une 500 `INTERNAL_ERROR`, journalisée avec son type et ses cadres dans `src/`, sans son message. Un module introuvable à l'intérieur de R2 est nommé dans les logs. Un résultat qui ne respecte pas `TrainResponse`, ou dont la métrique ou un seuil vaut `NaN` ou l'infini, donne aussi une 500, et les logs nomment les champs fautifs, sans leurs valeurs.
+
+### Rechargement du modèle servi
+
+Après une promotion, la route appelle `app.state.reload_model()`, posée par A2 (#15) dans le `lifespan` du routeur `predict` : une fonction synchrone, sans argument, qui recharge le `@champion` et met à jour `app.state.model_info`. `POST /predict` et `GET /health` donnent alors la nouvelle version. L'appel a lieu avant la libération du verrou, et aussi, par prudence, après un entraînement en échec ou un résultat non conforme, puisque l'alias a pu bouger. Si `reload_model` manque, n'est pas une fonction ou est asynchrone, la réponse reste 200 (l'entraînement a réussi) et un avertissement est journalisé ; si elle lève une exception (`SystemExit` et toute autre `BaseException` comprises), la réponse reste aussi 200 et l'erreur est journalisée avec son type et ses cadres, sans son message. Dans tous ces cas, `/predict` garde le modèle précédent jusqu'au prochain rechargement ou redémarrage.
+
+### Raccord avec R2 (lot P3)
+
+`train_and_promote(preset)` n'existe pas encore (#14). La route l'importe seulement à la demande (`get_train_and_promote`, dans `src/api/train.py`) : l'API démarre sans le module, et sans charger MLflow. Tant que `src/registry/promotion.py` manque, ou qu'il ne définit pas `train_and_promote`, une requête authentifiée reçoit 501 `NOT_IMPLEMENTED`. Ce statut est le même que celui des routes encore vides du contrat : la fonctionnalité n'est pas encore dans le code, ce n'est pas une panne passagère (503, qu'un client ou une sonde de santé pourrait réessayer). Une dépendance manquante à l'intérieur du module de R2 (MLflow absent, par exemple) n'est pas masquée : elle donne une 500 et ses cadres dans les logs.
+
+Ce que la route attend de R2 :
+
+- `train_and_promote(preset)` est synchrone et reçoit `default`, `rapide` ou `faible` en argument positionnel ;
+- elle renvoie une `TrainResponse`, un dictionnaire ou un objet qui ont au moins les huit champs de la réponse ci-dessus ; un champ en plus est ignoré, et les valeurs sont validées selon les règles souples de Pydantic (un entier pour un nombre décimal, par exemple) ;
+- elle lève une exception si l'entraînement échoue (préréglage absent de `config/training.yaml`, données manquantes) ;
+- elle déplace elle-même `@champion` et pose le tag `decision_threshold` ; la route ne touche pas au Model Registry.
+
+Quand R2 sera livrée, il restera à :
+
+1. vérifier que la valeur renvoyée par `train_and_promote` passe `TrainResponse` (un test de bout en bout avec le préréglage `rapide`) ;
+2. vérifier, avec A2, que `/predict` renvoie la nouvelle version après une promotion (critère de l'issue #21) ;
+3. retirer de ce document la mention « 501 tant que R2 n'est pas livrée » du tableau des routes.
+
+Les tests (`tests/api/test_train.py`) remplacent `train_and_promote` par une fausse fonction (`app.dependency_overrides[train.get_train_and_promote]`) ou par un faux module `src.registry.promotion`.
 
 ## GET /health
 
