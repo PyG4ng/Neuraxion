@@ -162,20 +162,6 @@ def test_request_model_refuses_broken_contracts(contract):
         schemas.build_request_model(contract)
 
 
-@pytest.mark.parametrize(
-    ("route", "body", "task"),
-    [
-        ("/feedback", {"inference_id": "6f1c2a7e-3b4d-4c8a-9e21-5d7f0a1b2c3d", "feedback": "agree"}, "F1"),
-    ],
-)
-def test_empty_routes_answer_501_in_the_common_format(client, route, body, task):
-    response = client.post(route, json=body)
-    assert response.status_code == 501
-    error = schemas.ErrorResponse.model_validate(response.json())
-    assert error.code == schemas.ErrorCode.NOT_IMPLEMENTED
-    assert task in error.detail
-
-
 def test_routes_are_documented_in_openapi(client):
     paths = client.get("/openapi.json").json()["paths"]
     assert {"/predict", "/train", "/feedback"} <= set(paths)
@@ -261,7 +247,7 @@ def test_wire_codes_are_the_documented_strings(client):
 
 def test_openapi_announces_the_documented_error_statuses(client):
     paths = client.get("/openapi.json").json()["paths"]
-    expected = {"/predict": {"422", "500", "503"}, "/train": {"401", "403", "409", "422", "501"}, "/feedback": {"404", "422", "501"}}
+    expected = {"/predict": {"422", "500", "503"}, "/train": {"401", "403", "409", "422", "501"}, "/feedback": {"404", "422", "503"}}
     for path, statuses in expected.items():
         assert statuses <= set(paths[path]["post"]["responses"])
 
