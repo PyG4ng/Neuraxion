@@ -33,7 +33,9 @@ NOT_FOUND_DETAIL = (
     "Aucune inférence réussie ne porte cet identifiant. "
     "Utilisez l'inference_id renvoyé par une réponse 200 de POST /predict."
 )
-DATABASE_UNAVAILABLE_DETAIL = "La base de données ne répond pas : le feedback n'a pas été enregistré. Réessayez dans quelques instants."
+DATABASE_UNAVAILABLE_DETAIL = (
+    "La base de données ne répond pas : le feedback n'a pas été enregistré. Réessayez dans quelques instants."
+)
 
 # PostgreSQL injoignable ou non configurée : le feedback ne peut pas être enregistré.
 DATABASE_DOWN = (
@@ -50,6 +52,8 @@ def store_feedback(inference_id: UUID, value: FeedbackValue) -> bool:
 
     Si la table ou la colonne feedback manque (base créée avant F1 et absente au démarrage,
     table supprimée depuis), le schéma est complété puis l'écriture est retentée une fois.
+    Compléter le schéma demande d'être propriétaire de la table : avec les seuls droits de la
+    route, create_schema() lève InsufficientPrivilege (réponse 500).
 
     Lève DatabaseNotConfigured ou psycopg.Error.
     """
@@ -88,19 +92,10 @@ def feedback(payload: FeedbackRequest) -> FeedbackResponse:
             payload.inference_id,
             type(error).__name__,
         )
-        raise ApiError(
-            503, ErrorCode.DATABASE_UNAVAILABLE, DATABASE_UNAVAILABLE_DETAIL
-        ) from None
+        raise ApiError(503, ErrorCode.DATABASE_UNAVAILABLE, DATABASE_UNAVAILABLE_DETAIL) from None
     if not found:
-        logger.info(
-            "Feedback refusé : aucune inférence réussie %s.", payload.inference_id
-        )
+        logger.info("Feedback refusé : aucune inférence réussie %s.", payload.inference_id)
         raise ApiError(404, ErrorCode.NOT_FOUND, NOT_FOUND_DETAIL)
-    logger.info(
-        "Feedback %s enregistré pour l'inférence %s.",
-        payload.feedback,
-        payload.inference_id,
-    )
-    return FeedbackResponse(
-        inference_id=payload.inference_id, feedback=payload.feedback
-    )
+    # La valeur choisie n'est pas journalisée, comme la décision dans POST /predict.
+    logger.info("Feedback enregistré pour l'inférence %s.", payload.inference_id)
+    return FeedbackResponse(inference_id=payload.inference_id, feedback=payload.feedback)

@@ -5,6 +5,11 @@
 -- La colonne feedback (tâche F1) est ajoutée à la fin, par ALTER TABLE, pour compléter aussi une
 -- table créée avant F1.
 
+-- ALTER TABLE prend un verrou exclusif à chaque passage, même si la colonne existe : une
+-- transaction restée ouverte sur la table ne bloque pas le démarrage plus de 5 s (échec
+-- journalisé, schéma retenté plus tard). SET LOCAL ne vaut que pour la transaction de create_schema().
+SET LOCAL lock_timeout = '5s';
+
 CREATE TABLE IF NOT EXISTS inferences (
     id                 uuid             PRIMARY KEY DEFAULT gen_random_uuid(),
     created_at         timestamptz      NOT NULL DEFAULT now(),

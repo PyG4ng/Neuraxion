@@ -38,7 +38,7 @@ Toutes les erreurs ont la même forme. Le client teste `code`, qui est stable, p
 | `BAD_REQUEST` | 400 | requête mal formée refusée avant la validation (UTF-8 invalide, JSON trop imbriqué), et tout autre statut 4xx non listé ici |
 | `UNAUTHORIZED` | 401 | `POST /train` sans en-tête `X-API-Key` |
 | `FORBIDDEN` | 403 | clé fausse, ou `TRAIN_API_KEY` non configurée sur le serveur (la route reste fermée) |
-| `NOT_FOUND` | 404 | route inconnue, ou `POST /feedback` sur une inférence inconnue |
+| `NOT_FOUND` | 404 | route inconnue, ou `POST /feedback` sur une inférence inconnue ou enregistrée en erreur |
 | `METHOD_NOT_ALLOWED` | 405 | méthode non prévue pour la route (`GET /predict`), avec l'en-tête `Allow` |
 | `TRAINING_IN_PROGRESS` | 409 | un entraînement est déjà en cours (levé explicitement par A3 ; une autre 409 reçoit `BAD_REQUEST`) |
 | `PAYLOAD_TOO_LARGE` | 413 | corps de plus de 64 Ko |
@@ -435,18 +435,18 @@ Un choix fermé, sans texte libre, rattaché à une inférence existante. Le fee
 {"inference_id": "6f1c2a7e-3b4d-4c8a-9e21-5d7f0a1b2c3d", "feedback": "disagree"}
 ```
 
-Erreurs : 404 si l'inférence n'existe pas, 422 pour une autre valeur que `agree` ou `disagree`.
+Erreurs : 404 si l'inférence n'existe pas ou a été enregistrée en erreur, 422 pour une autre valeur que `agree` ou `disagree`, 503 si la base ne répond pas.
 
 Comportement (F1, `src/api/feedback.py`) :
 
 - `inference_id` est celui d'une réponse 200 de `POST /predict`. Une inférence enregistrée en erreur n'a pas de décision : elle répond 404 comme une inférence inconnue (`NOT_FOUND`) ;
 - le choix est écrit dans la colonne `feedback` de la ligne ; un nouvel appel le remplace ;
-- `feedback` n'accepte que `agree` ou `disagree`, en minuscules : tout autre texte, une autre casse, une valeur vide ou d'un autre type est refusé (422 `VALIDATION_ERROR`, champ `feedback`), de même qu'un champ en plus (`champ inconnu`). Un `inference_id` qui n'est pas un UUID est refusé (422, champ `inference_id`). La valeur reçue n'est recopiée ni dans la réponse ni dans les logs ;
+- `feedback` n'accepte que `agree` ou `disagree`, en minuscules : tout autre texte, une autre casse, une valeur vide ou d'un autre type est refusé (422 `VALIDATION_ERROR`, champ `feedback`), de même qu'un champ en plus (`champ inconnu`). Un `inference_id` qui n'est pas un UUID est refusé (422, champ `inference_id`). Une valeur refusée n'est recopiée ni dans la réponse ni dans les logs ; la valeur acceptée est renvoyée dans la réponse 200, mais pas journalisée ;
 - PostgreSQL injoignable ou non configurée : 503 `DATABASE_UNAVAILABLE`, rien n'est enregistré ;
-- si la table ou la colonne manque encore (base absente au démarrage), la route exécute `create_schema()` puis réessaie une fois ;
+- si la table ou la colonne manque encore (base absente au démarrage), la route exécute `create_schema()` puis réessaie une fois. Compléter le schéma demande d'être propriétaire de la table : avec les seuls droits ci-dessous, la route répond alors 500 `INTERNAL_ERROR`, et il faut lancer `uv run python -m src.db.init_db` avec le rôle propriétaire ;
 - le feedback n'est jamais utilisé pour l'entraînement (décision d'équipe H14) : il sert seulement à suivre l'avis des utilisateurs sur les décisions.
 
-Droits PostgreSQL du rôle de l'API pour cette route : `SELECT` sur `id` et `status`, `UPDATE` sur `feedback`, par exemple `GRANT SELECT (id, status), UPDATE (feedback) ON inferences TO <rôle>`.
+Droits PostgreSQL du rôle de l'API pour cette route : `SELECT` sur `id` et `status`, `UPDATE` sur `feedback`, par exemple `GRANT SELECT (id, status), UPDATE (feedback) ON inferences TO <rôle>`. La colonne doit déjà exister (créée par le rôle propriétaire de la table).
 
 Pour suivre les avis :
 
@@ -492,7 +492,7 @@ Règles :
 - la décision enregistrée suit le seuil : `reject` si `prediction >= decision_threshold`, sinon `approve` (contrainte `CHECK`) ;
 - une ligne `error` garde les valeurs déjà connues (version du modèle, par exemple) et laisse vides les autres ;
 - ni adresse IP ni navigateur ne sont enregistrés, et les logs ne contiennent pas les données de la demande ;
-- la colonne `feedback` (F1) est ajoutée à la fin de `src/db/schema.sql` par `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, avec sa contrainte `CHECK (feedback IN ('agree', 'disagree'))` : une table créée avant F1 est complétée au démarrage suivant, sans perdre ses lignes ;
+- la colonne `feedback` (F1) est ajoutée à la fin de `src/db/schema.sql` par `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, avec sa contrainte `CHECK (feedback IN ('agree', 'disagree'))` : une table créée avant F1 est complétée au démarrage suivant, sans perdre ses lignes. Cet `ALTER TABLE` prend un verrou exclusif bref à chaque passage, limité à 5 s par `lock_timeout` : une transaction restée ouverte sur la table fait échouer la création du schéma (journalisée), sans bloquer le démarrage ;
 - seule une ligne `success` peut recevoir un feedback.
 
 Pour retrouver une inférence et la version du modèle :
