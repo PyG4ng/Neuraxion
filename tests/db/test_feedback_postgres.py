@@ -270,20 +270,26 @@ def test_create_schema_does_not_wait_more_than_its_lock_timeout(database):
     init_db.create_schema()
     # Lecture restée ouverte : ACCESS SHARE, incompatible avec le verrou exclusif de l'ALTER TABLE.
     with LockHolder(database, ("SELECT 1 FROM inferences LIMIT 1",)):
-        started = time.monotonic()
-        with pytest.raises(psycopg.errors.LockNotAvailable):
-            init_db.create_schema()
-        elapsed = time.monotonic() - started
+        # Connexion ouverte avant la mesure : seule l'attente du verrou est chronométrée (avec
+        # POSTGRES_HOST=localhost, Windows perd environ 2 s par connexion à essayer ::1).
+        with database.connect() as conn:
+            started = time.monotonic()
+            with pytest.raises(psycopg.errors.LockNotAvailable):
+                init_db.create_schema(conn)
+            elapsed = time.monotonic() - started
     assert 4.5 <= elapsed < 6.5, elapsed  # lock_timeout de 5 s
 
 
 def test_advisory_lock_held_elsewhere_does_not_block_create_schema(database):
     # Une autre création bloquée garde le verrou consultatif : l'attente est bornée elle aussi.
     with LockHolder(database, ("SELECT pg_advisory_lock(%s)", (init_db.SCHEMA_LOCK_KEY,))):
-        started = time.monotonic()
-        with pytest.raises(psycopg.errors.LockNotAvailable):
-            init_db.create_schema()
-        elapsed = time.monotonic() - started
+        # Connexion ouverte avant la mesure : seule l'attente du verrou est chronométrée (avec
+        # POSTGRES_HOST=localhost, Windows perd environ 2 s par connexion à essayer ::1).
+        with database.connect() as conn:
+            started = time.monotonic()
+            with pytest.raises(psycopg.errors.LockNotAvailable):
+                init_db.create_schema(conn)
+            elapsed = time.monotonic() - started
     assert 4.5 <= elapsed < 6.5, elapsed  # lock_timeout de 5 s
 
 
@@ -297,7 +303,9 @@ def test_locked_row_answers_503_within_the_route_timeout_then_200(make_app, serv
             elapsed = time.monotonic() - started
         assert locked.status_code == 503, locked.text
         assert locked.json()["code"] == "DATABASE_UNAVAILABLE"
-        assert 1.8 <= elapsed < 3.5, elapsed  # lock_timeout de 2 s de la route
+        # lock_timeout de 2 s de la route, plus l'ouverture de sa connexion (jusqu'à 2 s de plus
+        # avec POSTGRES_HOST=localhost sous Windows) ; le délai de 5 s du schéma en est exclu.
+        assert 1.8 <= elapsed < 4.8, elapsed
         assert feedback_of(database, inference_id) is None  # l'écriture de l'autre session a été annulée
         released = client.post("/feedback", json={"inference_id": inference_id, "feedback": "disagree"})
     assert released.status_code == 200
