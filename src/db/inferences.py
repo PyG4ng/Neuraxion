@@ -1,4 +1,4 @@
-"""Enregistrement des inférences dans la table inferences (tâche A2).
+"""Enregistrement des inférences dans la table inferences (tâche A2) et de leur feedback (F1).
 
 Chaque inférence validée est enregistrée, réussie (status = 'success') ou en erreur
 (status = 'error'), avec sa durée. Une requête refusée par la validation (422) ne l'est pas.
@@ -19,6 +19,7 @@ from psycopg.types.json import Jsonb
 from src.db.connection import connect
 
 Status = Literal["success", "error"]
+FEEDBACK_VALUES = ("agree", "disagree")
 
 INSERT_INFERENCE = """
 INSERT INTO inferences (
@@ -28,6 +29,13 @@ INSERT INTO inferences (
     %(id)s, %(created_at)s, %(input_data)s, %(prediction)s, %(decision)s, %(decision_threshold)s,
     %(model_name)s, %(model_version)s, %(status)s, %(error_message)s, %(latency_ms)s
 )
+"""
+
+# Seule une inférence réussie porte une décision à laquelle on peut être d'accord ou non.
+# Droits nécessaires : SELECT sur id et status, UPDATE sur feedback (pas de RETURNING).
+UPDATE_FEEDBACK = """
+UPDATE inferences SET feedback = %(feedback)s
+WHERE id = %(id)s AND status = 'success'
 """
 
 
@@ -98,3 +106,30 @@ def save_inference(record: InferenceRecord, connection: psycopg.Connection | Non
         return record.id
     connection.execute(INSERT_INFERENCE, record.as_parameters())
     return record.id
+
+
+def save_feedback(inference_id: UUID, feedback: str, connection: psycopg.Connection | None = None) -> bool:
+    """Enregistre agree ou disagree sur une inférence réussie ; remplace un feedback précédent.
+
+    Paramètres
+        inference_id : identifiant renvoyé par POST /predict.
+        feedback : agree ou disagree.
+        connection : connexion ouverte à réutiliser (la transaction reste à valider par
+            l'appelant) ; sans elle, une connexion est ouverte, validée puis refermée.
+
+    Renvoie
+        True si la ligne a été mise à jour, False si aucune inférence réussie ne porte cet id
+        (inférence inconnue, ou en erreur et donc sans décision).
+
+    Lève
+        ValueError pour une autre valeur que agree ou disagree, DatabaseNotConfigured si les
+        variables POSTGRES_* manquent, psycopg.Error si PostgreSQL ne répond pas, si la colonne
+        feedback manque (UndefinedColumn) ou si le rôle n'a pas les droits.
+    """
+    if feedback not in FEEDBACK_VALUES:
+        raise ValueError("feedback vaut agree ou disagree.")
+    parameters = {"id": inference_id, "feedback": feedback}
+    if connection is None:
+        with connect() as own_connection:
+            return own_connection.execute(UPDATE_FEEDBACK, parameters).rowcount == 1
+    return connection.execute(UPDATE_FEEDBACK, parameters).rowcount == 1

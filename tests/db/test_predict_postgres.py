@@ -33,7 +33,7 @@ def test_create_schema_is_idempotent_and_builds_the_documented_table(database):
         indexes = conn.execute(
             "SELECT indexname FROM pg_indexes WHERE schemaname = %s AND tablename = 'inferences'", (database.schema,)
         ).fetchall()
-    assert len(columns) == 11
+    assert len(columns) == 12  # 11 colonnes de A2, plus feedback (F1)
     assert {"inferences_created_at_idx", "inferences_model_version_idx", "inferences_pkey"} <= {i for (i,) in indexes}
 
 

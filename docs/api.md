@@ -12,7 +12,7 @@ Chaque exemple JSON précédé d'un commentaire `exemple` est vérifié par `tes
 | `POST /train` | entraîner, puis promouvoir si le seuil est atteint | A3 | 200 (501 tant que R2 n'est pas livrée) |
 | `GET /health` | état de l'API, de la base et du modèle | A1 | 200 |
 | `GET /schema` | contrat de données pour le formulaire | A1 | 200 |
-| `POST /feedback` | accord ou désaccord avec une décision (facultatif) | F1 | 501 |
+| `POST /feedback` | accord ou désaccord avec une décision (facultatif) | F1 | 200 |
 
 Les routes encore vides répondent 501 au format d'erreur commun, en nommant la tâche qui les remplira. Toutes les erreurs, y compris les erreurs de validation (422), les routes inconnues (404) et les erreurs imprévues (500), ont le format commun ci-dessous (`src/api/errors.py`).
 
@@ -38,7 +38,7 @@ Toutes les erreurs ont la même forme. Le client teste `code`, qui est stable, p
 | `BAD_REQUEST` | 400 | requête mal formée refusée avant la validation (UTF-8 invalide, JSON trop imbriqué), et tout autre statut 4xx non listé ici |
 | `UNAUTHORIZED` | 401 | `POST /train` sans en-tête `X-API-Key` |
 | `FORBIDDEN` | 403 | clé fausse, ou `TRAIN_API_KEY` non configurée sur le serveur (la route reste fermée) |
-| `NOT_FOUND` | 404 | route inconnue, ou `POST /feedback` sur une inférence inconnue |
+| `NOT_FOUND` | 404 | route inconnue, ou `POST /feedback` sur une inférence inconnue ou enregistrée en erreur |
 | `METHOD_NOT_ALLOWED` | 405 | méthode non prévue pour la route (`GET /predict`), avec l'en-tête `Allow` |
 | `TRAINING_IN_PROGRESS` | 409 | un entraînement est déjà en cours (levé explicitement par A3 ; une autre 409 reçoit `BAD_REQUEST`) |
 | `PAYLOAD_TOO_LARGE` | 413 | corps de plus de 64 Ko |
@@ -435,7 +435,28 @@ Un choix fermé, sans texte libre, rattaché à une inférence existante. Le fee
 {"inference_id": "6f1c2a7e-3b4d-4c8a-9e21-5d7f0a1b2c3d", "feedback": "disagree"}
 ```
 
-Erreurs : 404 si l'inférence n'existe pas, 422 pour une autre valeur que `agree` ou `disagree`.
+Erreurs : 404 si l'inférence n'existe pas ou a été enregistrée en erreur, 422 pour une autre valeur que `agree` ou `disagree`, 503 si la base ne répond pas, 500 si la colonne manque et que le rôle ne peut pas la créer.
+
+Comportement (F1, `src/api/feedback.py`) :
+
+- `inference_id` est celui d'une réponse 200 de `POST /predict`. Une inférence enregistrée en erreur n'a pas de décision : elle répond 404 comme une inférence inconnue (`NOT_FOUND`) ;
+- le choix est écrit dans la colonne `feedback` de la ligne ; un nouvel appel le remplace ;
+- `feedback` n'accepte que `agree` ou `disagree`, en minuscules : tout autre texte, une autre casse, une valeur vide ou d'un autre type est refusé (422 `VALIDATION_ERROR`, champ `feedback`), de même qu'un champ en plus (`champ inconnu`). Un `inference_id` qui n'est pas un UUID est refusé (422, champ `inference_id`). Une valeur refusée n'est recopiée ni dans la réponse ni dans les logs ; la valeur acceptée est renvoyée dans la réponse 200, mais pas journalisée ;
+- base injoignable ou non configurée : 503 `DATABASE_UNAVAILABLE`, rien n'est enregistré ;
+- ligne verrouillée par une autre transaction : la route attend au plus 2 s (`lock_timeout`), puis répond 503 `DATABASE_UNAVAILABLE` sans rien enregistrer. Sur le chemin qui complète le schéma, c'est le délai de `create_schema()` qui s'applique (5 s par verrou attendu) ;
+- si la table ou la colonne manque encore (base absente au démarrage), la route exécute `create_schema()` puis réessaie une fois. Compléter le schéma demande d'être propriétaire de la table : avec les seuls droits ci-dessous, la route répond alors 500 `INTERNAL_ERROR`, et il faut lancer `uv run python -m src.db.init_db` avec le rôle propriétaire, puis refaire le `GRANT` ci-dessous (un droit sur une colonne disparaît avec elle) ;
+- le feedback n'est jamais utilisé pour l'entraînement (décision d'équipe H14) : il sert seulement à suivre l'avis des utilisateurs sur les décisions.
+
+Droits PostgreSQL du rôle de l'API pour cette route : `SELECT` sur `id` et `status`, `UPDATE` sur `feedback`, par exemple `GRANT SELECT (id, status), UPDATE (feedback) ON inferences TO <rôle>`. La colonne doit déjà exister (créée par le rôle propriétaire de la table). Si la table n'est pas dans le schéma `public`, le rôle a aussi besoin de `USAGE` sur son schéma.
+
+Pour suivre les avis :
+
+```sql
+SELECT decision, feedback, count(*)
+FROM inferences
+WHERE status = 'success'
+GROUP BY decision, feedback;
+```
 
 ## Table inferences
 
@@ -445,7 +466,7 @@ Créée par `src/db/schema.sql`, que le backend exécute à chaque démarrage (`
 uv run python -m src.db.init_db
 ```
 
-La commande lit les variables `POSTGRES_*`, affiche `Table inferences prête (src/db/schema.sql).` et sort avec le code 0, ou affiche `Schéma non créé : ...` et sort avec le code 1, sans le message de psycopg. Le script est idempotent : une table qui existe déjà garde ses lignes, et seuls les index manquants sont créés.
+La commande lit les variables `POSTGRES_*`, affiche `Table inferences prête (src/db/schema.sql).` et sort avec le code 0, ou affiche `Schéma non créé : ...` et sort avec le code 1, sans le message de psycopg. Le script est idempotent : une table qui existe déjà garde ses lignes, et seuls les index et la colonne `feedback` manquants sont créés.
 
 | Colonne | Type | Rôle |
 |---|---|---|
@@ -460,6 +481,7 @@ La commande lit les variables `POSTGRES_*`, affiche `Table inferences prête (sr
 | `status` | text | `success` ou `error` |
 | `error_message` | text | cause maîtrisée de l'échec, non vide si `status = 'error'`, vide sinon ; jamais un message d'exception brut qui recopierait la demande |
 | `latency_ms` | integer | durée du traitement en millisecondes |
+| `feedback` | text | `agree` ou `disagree`, posé par `POST /feedback` (F1) ; vide tant qu'aucun avis n'est donné |
 
 Règles :
 
@@ -471,7 +493,8 @@ Règles :
 - la décision enregistrée suit le seuil : `reject` si `prediction >= decision_threshold`, sinon `approve` (contrainte `CHECK`) ;
 - une ligne `error` garde les valeurs déjà connues (version du modèle, par exemple) et laisse vides les autres ;
 - ni adresse IP ni navigateur ne sont enregistrés, et les logs ne contiennent pas les données de la demande ;
-- la colonne `feedback` sera ajoutée par la tâche F1, avec `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`.
+- la colonne `feedback` (F1) est ajoutée à la fin de `src/db/schema.sql` par `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, avec sa contrainte `CHECK (feedback IN ('agree', 'disagree'))` : une table créée avant F1 est complétée au démarrage suivant, sans perdre ses lignes. Cet `ALTER TABLE` prend un verrou exclusif bref à chaque passage. `create_schema()` borne à 5 s l'attente de chaque verrou (`lock_timeout`, posé avant le verrou consultatif) : une transaction restée ouverte sur la table, ou une autre création bloquée, retarde le démarrage de 5 s par verrou attendu (environ 10 s pour une instance qui démarre pendant qu'une autre attend déjà : verrou consultatif, puis table), puis la création échoue (`LockNotAvailable`, journalisée) et le démarrage continue. `CREATE INDEX IF NOT EXISTS` verrouille aussi la table à chaque passage, sous le même délai. Pendant cette attente, les écritures des autres instances patientent aussi ;
+- seule une ligne `success` peut recevoir un feedback.
 
 Pour retrouver une inférence et la version du modèle :
 
@@ -489,13 +512,13 @@ Deux dossiers :
 - `tests/api` : l'API sans base ni MLflow (fausses connexions, faux `@champion`, fausse `train_and_promote`). Les variables `POSTGRES_*` y sont retirées pendant chaque test ;
 - `tests/db` : l'application complète contre un vrai PostgreSQL, configuré par les variables `POSTGRES_*` (`src/db/connection.py`).
 
-Sans base, les 24 tests de `tests/db` sont sautés :
+Sans base, les 37 tests de `tests/db` sont sautés :
 
 ```bash
 uv run pytest tests/api tests/db
 ```
 
-Résultat attendu : 511 tests réussis et 24 sautés, avec un avertissement final qui rappelle que les tests PostgreSQL n'ont pas tourné.
+Résultat attendu : 569 tests réussis et 37 sautés, avec un avertissement final qui rappelle que les tests PostgreSQL n'ont pas tourné.
 
 Avec le PostgreSQL de Compose (depuis la racine du dépôt, `.env.production` rempli) :
 
@@ -512,7 +535,7 @@ $env:POSTGRES_HOST = "127.0.0.1"; $env:POSTGRES_PORT = "5433"
 uv run --env-file .env.production pytest tests/api tests/db
 ```
 
-Résultat attendu : 535 tests réussis, aucun sauté.
+Résultat attendu : 606 tests réussis, aucun sauté. Les trois tests d'attente de verrou de `test_feedback_postgres.py` durent environ 5 s, 5 s et 2 s (délais de `lock_timeout`).
 
 Pour séparer tout à fait les tests de l'historique, on peut aussi les lancer sur une base dédiée du même serveur, créée une fois : `docker compose exec postgres createdb -U neuraxion neuraxion_test` (l'utilisateur est celui de `.env.production`), puis ajouter `POSTGRES_DB=neuraxion_test` devant la commande ci-dessus. `uv run --env-file` lit l'utilisateur, le mot de passe et la base dans `.env.production` ; les variables déjà posées dans le terminal passent avant celles du fichier, si bien que `POSTGRES_HOST=postgres` et `POSTGRES_PORT=5432`, valables entre conteneurs, sont remplacés par l'adresse vue depuis la machine. Écrire `127.0.0.1` plutôt que `localhost` : sous Windows, `localhost` essaie d'abord `::1`, où Compose ne publie pas le port, et chaque connexion perd alors 2 s (`GET /health` répond `degraded`).
 
@@ -522,16 +545,17 @@ Règles de `tests/db/conftest.py` :
 - `POSTGRES_PORT` qui n'est pas un entier, ou base configurée mais injoignable : chaque test échoue, avec le type de l'erreur et l'adresse à vérifier, pour qu'une base arrêtée ne passe pas pour un succès ;
 - chaque test travaille dans un schéma temporaire `neuraxion_test_...`, supprimé à la fin. `PGOPTIONS` le place seul dans le `search_path` de toutes les connexions du processus : les connexions ouvertes par l'API et par les tests n'écrivent pas dans la table `inferences` du schéma `public`, qui garde l'historique de la base de Compose (un test le vérifie). Un code qui changerait lui-même son `search_path` échapperait à cette protection : `src/` n'en contient aucun. `PGSERVICE` et `PGSERVICEFILE` sont retirés, car un fichier de service passerait avant `PGOPTIONS`. Avant chaque test, la fixture vérifie que `current_schema()` est bien le schéma temporaire, et sinon échoue sans lancer le test ;
 - un processus tué en plein test (Ctrl+C répété, coupure) peut laisser un schéma `neuraxion_test_...`. Pour les lister, quand aucun test ne tourne : `SELECT nspname FROM pg_namespace WHERE nspname LIKE 'neuraxion\_test\_%';`, puis `DROP SCHEMA <nom> CASCADE;` pour chacun ;
-- un test crée un rôle temporaire `neuraxion_api_limitee_...`, qui a seulement le droit d'insérer, puis le supprime. L'utilisateur de `.env.production` doit donc pouvoir créer un schéma et un rôle, ce qui est le cas de l'utilisateur créé par l'image `postgres` ;
+- des tests créent des rôles temporaires, puis les suppriment : `neuraxion_api_limitee_...`, qui a seulement le droit d'insérer, et `neuraxion_feedback_limitee_...`, qui a seulement `USAGE` sur le schéma de test et le `GRANT` de `POST /feedback`. Leurs droits portent sur le schéma de test, jamais sur `public`. L'utilisateur de `.env.production` doit donc pouvoir créer un schéma et un rôle, ce qui est le cas de l'utilisateur créé par l'image `postgres` ;
 - le `@champion` (R1) est remplacé par un faux module `src.registry.champion`, et `train_and_promote` (R2) par une fausse fonction : ni MLflow ni entraînement réel.
 
-Vérifications du §13 et de l'issue #22 :
+Vérifications du §13, de l'issue #22 et de F1 (#38) :
 
 | Vérification | Sans base (`tests/api`) | Avec PostgreSQL (`tests/db`) |
 |---|---|---|
 | §13 n° 3 : `POST /predict` avec une entrée valide et une entrée invalide | `test_predict.py` (`test_prediction_returns_a_decision_and_records_one_row_with_the_version`, `test_unknown_fields_are_refused_and_not_recorded`, `test_validation_errors_are_not_recorded`) | `test_api_postgres.py::test_valid_then_invalid_request_and_the_documented_query` |
 | §13 n° 4 et critère I : une prédiction réussie est enregistrée avec la version du modèle | `test_predict.py` (même test, sur une fausse connexion ; `test_model_name_defaults_to_the_environment_then_credit_default` pour le nom) | `test_predict_postgres.py::test_prediction_creates_a_row_with_the_version` et `test_the_row_records_the_name_of_the_served_model` ; `test_api_postgres.py` : requête SQL de la section « Table inferences », version après une promotion, lignes gardées après un redémarrage |
 | `POST /train` sans clé et avec une mauvaise clé | `test_train.py` (`test_without_header_answers_401_in_the_common_format`, `test_a_wrong_key_answers_403`) | `test_api_postgres.py::test_train_without_key_or_with_a_wrong_key_changes_nothing` : 401 ou 403, ni entraînement, ni rechargement, ni ligne en base ; `test_train_stays_closed_when_the_server_key_is_not_configured` : 403 si `TRAIN_API_KEY` est absente, vide ou faite d'espaces |
+| `POST /feedback` (F1) : choix fermé enregistré sur une inférence existante | `test_feedback.py` (succès, 404, 422 pour un texte libre, 503, réessai après complétion du schéma, requête et `GRANT` documentés) | `test_feedback_postgres.py` : colonne ajoutée de façon idempotente, choix remplacé, 404 pour une inférence inconnue ou en erreur, contrainte `CHECK`, droits documentés, attentes de verrou bornées |
 
 ## Points à confirmer à la revue des contrats (C6)
 

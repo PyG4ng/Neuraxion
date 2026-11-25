@@ -306,13 +306,6 @@ def test_unexpected_error_gets_500_without_its_message(make_app, caplog):
     assert "ValueError" in caplog.text
 
 
-def test_existing_stub_routes_still_answer_501(client):
-    feedback = {"inference_id": "6f1c2a7e-3b4d-4c8a-9e21-5d7f0a1b2c3d", "feedback": "agree"}
-    # POST /predict (A2) et POST /train (A3) ne sont plus des routes vides.
-    response = client.post("/feedback", json=feedback)
-    assert response.status_code == 501
-    assert response.json()["code"] == "NOT_IMPLEMENTED"
-
 
 # --- logs ------------------------------------------------------------------
 
