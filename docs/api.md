@@ -10,11 +10,11 @@ Chaque exemple JSON précédé d'un commentaire `exemple` est vérifié par `tes
 |---|---|---|---|
 | `POST /predict` | prédire le risque de défaut d'une demande | A2 | 501 |
 | `POST /train` | entraîner, puis promouvoir si le seuil est atteint | A3 | 501 |
-| `GET /health` | état de l'API, de la base et du modèle | A1 | route absente |
-| `GET /schema` | contrat de données pour le formulaire | A1 | route absente |
+| `GET /health` | état de l'API, de la base et du modèle | A1 | 200 |
+| `GET /schema` | contrat de données pour le formulaire | A1 | 200 |
 | `POST /feedback` | accord ou désaccord avec une décision (facultatif) | F1 | 501 |
 
-Les routes encore vides répondent 501 au format d'erreur commun, en nommant la tâche qui les remplira. Les erreurs de validation (422) prendront le format commun avec le gestionnaire d'erreurs de A1 ; d'ici là, FastAPI renvoie son format par défaut.
+Les routes encore vides répondent 501 au format d'erreur commun, en nommant la tâche qui les remplira. Toutes les erreurs, y compris les erreurs de validation (422), les routes inconnues (404) et les erreurs imprévues (500), ont le format commun ci-dessous (`src/api/errors.py`).
 
 ## Format d'erreur commun
 
@@ -23,7 +23,7 @@ Toutes les erreurs ont la même forme. Le client teste `code`, qui est stable, p
 <!-- exemple: ErrorResponse -->
 ```json
 {
-  "detail": "La demande contient des valeurs non permises.",
+  "detail": "La demande a été refusée : 2 champs ne respectent pas le contrat. Les champs attendus sont décrits par GET /schema.",
   "code": "VALIDATION_ERROR",
   "errors": [
     {"field": "annual_inc", "message": "doit être supérieur ou égal à 0"},
@@ -34,15 +34,45 @@ Toutes les erreurs ont la même forme. Le client teste `code`, qui est stable, p
 
 | Code | Statut HTTP | Cas |
 |---|---|---|
-| `VALIDATION_ERROR` | 422 | corps invalide : type, borne, valeur non permise, champ manquant ou inconnu |
+| `VALIDATION_ERROR` | 422 | corps invalide : JSON mal formé, type, borne, valeur non permise, champ manquant ou inconnu |
+| `BAD_REQUEST` | 400 | requête mal formée refusée avant la validation (UTF-8 invalide, JSON trop imbriqué), et tout autre statut 4xx non listé ici |
 | `UNAUTHORIZED` | 401 | `POST /train` sans en-tête `X-API-Key` |
 | `FORBIDDEN` | 403 | clé fausse, ou `TRAIN_API_KEY` non configurée sur le serveur (la route reste fermée) |
-| `NOT_FOUND` | 404 | `POST /feedback` sur une inférence inconnue |
-| `TRAINING_IN_PROGRESS` | 409 | un entraînement est déjà en cours |
-| `INTERNAL_ERROR` | 500 | erreur inattendue, détaillée dans les logs du backend |
+| `NOT_FOUND` | 404 | route inconnue, ou `POST /feedback` sur une inférence inconnue |
+| `METHOD_NOT_ALLOWED` | 405 | méthode non prévue pour la route (`GET /predict`), avec l'en-tête `Allow` |
+| `TRAINING_IN_PROGRESS` | 409 | un entraînement est déjà en cours (levé explicitement par A3 ; une autre 409 reçoit `BAD_REQUEST`) |
+| `PAYLOAD_TOO_LARGE` | 413 | corps de plus de 64 Ko |
+| `INTERNAL_ERROR` | 500 | erreur inattendue, détaillée dans les logs du backend, et tout autre statut 5xx non listé ici |
 | `NOT_IMPLEMENTED` | 501 | route posée par le contrat, pas encore écrite |
 | `MODEL_UNAVAILABLE` | 503 | aucun modèle validé, ou colonnes du modèle différentes du contrat de données |
 | `DATABASE_UNAVAILABLE` | 503 | PostgreSQL ne répond pas |
+
+## Démarrage, validation et logs (A1)
+
+Lancement : `uv run uvicorn src.api.main:app`. Au démarrage, `src/api/main.py` :
+
+1. lit `contracts/features.yaml` et construit la classe de requête avec `build_request_model()` ;
+2. lit `contracts/examples.json`, un objet dont chaque clé est un profil et chaque valeur une demande complète, et valide chaque exemple avec cette classe ;
+3. inclut les routeurs `predict`, `train` et `feedback`, puis `GET /health` et `GET /schema`.
+
+Si l'un des deux fichiers manque, est illisible ou ne respecte pas le contrat, l'API ne démarre pas : uvicorn affiche une seule ligne `Démarrage impossible : ...`, qui nomme le fichier (et le profil fautif pour un exemple). Le contrat est contrôlé variable par variable : nom en lettres, chiffres et `_` (pas de `model_` en tête), `min` et `max` numériques (entiers pour une variable `integer`), `allowed` liste non vide, sans doublon, du bon type et dans les bornes, `example` conforme à la variable, `required` booléen, `label` et `unit` textes. Un fichier illisible (droits, encodage) est signalé de la même façon. `version` s'écrit entre guillemets (`version: "1.10"`), sinon YAML la lit comme un nombre.
+
+Validation de la requête de `POST /predict` :
+
+- un champ inconnu est refusé (`champ inconnu`) ;
+- les types sont stricts : `"12000"` (texte) ou `true` ne sont pas des nombres, et `2.5` comme `36.0` ne sont pas des entiers, y compris pour une variable munie de `allowed` (publiée dans le JSON Schema par `enum`) ;
+- `Infinity` et `NaN`, que le décodeur JSON de Python accepte, sont refusés ;
+- les messages de `errors` sont en français et ne recopient jamais la valeur reçue ; au-delà de 50 erreurs, seules les 50 premières sont listées et `detail` donne le total ;
+- un corps de plus de 64 Ko est refusé (413 `PAYLOAD_TOO_LARGE`) : dès l'en-tête s'il annonce sa taille, sinon pendant sa lecture par une route qui lit le corps (une route inconnue répond 404 sans le lire) ;
+- une erreur qui porte sur le corps entier (JSON mal formé, corps qui n'est pas un objet) a un `detail` qui le dit et le champ `corps` dans `errors`. Un corps que le décodeur refuse avant la validation (UTF-8 invalide, JSON imbriqué à l'extrême) reçoit 400 `BAD_REQUEST`.
+
+Les routes signalent une erreur maîtrisée en levant `ApiError(status_code, code, detail, headers=None)` (`src/api/errors.py`), par exemple `ApiError(503, ErrorCode.MODEL_UNAVAILABLE, ...)` dans A2 ou `ApiError(401, ErrorCode.UNAUTHORIZED, ...)` dans A3. Une exception imprévue donne une 500 `INTERNAL_ERROR`, sans son message. Une exception levée après le début de la réponse (tâche d'arrière-plan, réponse en flux) est aussi rattrapée et journalisée sans son message.
+
+Logs (`neuraxion.api`, sortie d'erreur) : une ligne par requête avec la méthode (`<méthode inconnue>` si le client en invente une), le modèle de route (`/predict`, `/essai/{code}`, jamais le chemin brut ni les paramètres), le statut et la durée, par exemple `POST /predict -> 422 (3 ms)`. Une demande refusée ajoute une ligne qui nomme les champs de premier niveau déclarés par la route (les variables du contrat pour `/predict`) et compte les autres (champs inconnus, clés de dictionnaire) sans les nommer. Les messages de `errors` ne reprennent que des textes fixes ou les valeurs du contrat : le message d'un validateur personnalisé devient `valeur invalide`. Une erreur interne ajoute le type de l'exception et les cadres de pile situés dans `src/` (fichier, ligne, fonction), sans le message. Le journal d'accès d'uvicorn, qui contient l'adresse IP du client, est coupé à la création de l'application et de nouveau au démarrage ; la commande de démarrage d'I1 peut aussi passer `--no-access-log`.
+
+Raccord avec A2 : le modèle servi est décrit par `app.state.model_info` (`ModelInfo`, un objet qui a les attributs `name`, `version` et `decision_threshold`, ou `None` tant qu'aucun modèle n'est chargé). A2 le renseigne depuis le routeur `predict` (paramètre `lifespan` de l'`APIRouter`, que FastAPI fusionne avec celui de l'application), sans modifier `main.py`. Une valeur mal formée est traitée comme absente par `/health`, avec un avertissement dans les logs. Les tests de A2 doivent ouvrir le client avec `with TestClient(app) as client`, sans quoi le lifespan ne s'exécute pas.
+
+Base de données : `src/db/connection.py` lit `POSTGRES_HOST` (`localhost` par défaut), `POSTGRES_PORT` (5432 par défaut ; 5433 depuis la machine hôte avec Compose), `POSTGRES_USER`, `POSTGRES_PASSWORD` et `POSTGRES_DB`. Sans ces trois dernières variables (ou si l'une est vide), `/health` répond `database: unavailable` sans tenter de connexion. `/health` répond en 2 s au plus, même si la base ne répond pas, et accepte aussi `HEAD`. Un seul contrôle de la base tourne à la fois, dans un fil démon : les appels qui arrivent pendant ce contrôle l'attendent (au plus 2 s) au lieu d'en lancer d'autres, et un contrôle bloqué n'empêche pas l'arrêt du processus. `database_check` doit être une fonction synchrone qui renvoie `True` si la base répond ; toute autre valeur compte comme `unavailable`. A2 réutilise ce module.
 
 ## POST /predict
 
@@ -341,6 +371,8 @@ LIMIT 5;
 ## Points à confirmer à la revue des contrats (C6)
 
 - Le format de `contracts/features.yaml` (lot P1). `build_request_model()` suppose pour chaque variable : `name` et `type` (`numeric`, `integer` ou `categorical`) obligatoires ; `min`, `max`, `allowed`, `required` (vrai par défaut), `label`, `unit` et `example` facultatifs.
+- Le format de `contracts/examples.json` (lot P1) : un objet profil → demande complète, par exemple `{"prudent": {...}, "moyen": {...}, "risque": {...}}`.
+- Les types stricts de la requête : l'interface envoie des nombres JSON, jamais du texte.
 - Les valeurs `agree` et `disagree` du feedback.
 - Le raccordement A1 → A2 : A1 construit la classe de requête et appelle `predict.build_router()` ; A2 remplit le corps de la route sans changer sa signature.
 - Les choix propres à C4 : codes d'erreur supplémentaires, `GET /health` toujours en 200 avec `ok` ou `degraded`.

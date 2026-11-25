@@ -7,16 +7,35 @@ construit à partir du contrat de données (contracts/features.yaml, lot P1).
 """
 
 from enum import StrEnum
-from typing import Any, Literal
+import math
+import re
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, create_model, model_validator
+import annotated_types
+from pydantic import (
+    AfterValidator,
+    AllowInfNan,
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    Strict,
+    TypeAdapter,
+    ValidationError,
+    WithJsonSchema,
+    create_model,
+    model_validator,
+)
+from pydantic_core import PydanticCustomError
 
 Decision = Literal["approve", "reject"]
 Preset = Literal["default", "rapide", "faible"]
 FeedbackValue = Literal["agree", "disagree"]
 
 FEATURE_TYPES = ("numeric", "integer", "categorical")
+FEATURE_NAME_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
+MAX_EXACT_INTEGER = 2**53
 
 # Une version du Model Registry est un entier positif écrit en texte ("1", "2"...), jamais l'alias.
 MODEL_VERSION_PATTERN = r"^[1-9][0-9]*$"
@@ -26,10 +45,13 @@ class ErrorCode(StrEnum):
     """Codes machine du format d'erreur commun, avec le statut HTTP qui les accompagne."""
 
     VALIDATION_ERROR = "VALIDATION_ERROR"  # 422
+    BAD_REQUEST = "BAD_REQUEST"  # 400
     UNAUTHORIZED = "UNAUTHORIZED"  # 401
     FORBIDDEN = "FORBIDDEN"  # 403
     NOT_FOUND = "NOT_FOUND"  # 404
+    METHOD_NOT_ALLOWED = "METHOD_NOT_ALLOWED"  # 405
     TRAINING_IN_PROGRESS = "TRAINING_IN_PROGRESS"  # 409
+    PAYLOAD_TOO_LARGE = "PAYLOAD_TOO_LARGE"  # 413
     INTERNAL_ERROR = "INTERNAL_ERROR"  # 500
     NOT_IMPLEMENTED = "NOT_IMPLEMENTED"  # 501
     MODEL_UNAVAILABLE = "MODEL_UNAVAILABLE"  # 503
@@ -257,22 +279,35 @@ def build_request_model(contract: dict[str, Any], name: str = "PredictRequest") 
     Un champ facultatif absent vaut None. Le modèle produit refuse les champs inconnus.
 
     Paramètres
-        contract : contrat déjà lu, par exemple avec src.training.load_contract().
+        contract : contrat déjà lu, par exemple par src.api.main.load_contract().
         name : nom du modèle produit, visible dans le schéma OpenAPI.
 
     Renvoie
         Une classe Pydantic, à utiliser comme corps de la route.
 
     Lève
-        ValueError si le contrat est vide, si un nom est répété ou si un type est inconnu.
+        ValueError si le contrat est vide ou mal formé, si un nom est répété ou si un type est inconnu.
     """
+    if not isinstance(contract, dict):
+        raise ValueError("Le contrat doit être un dictionnaire YAML avec une clé features.")
     features = contract.get("features")
-    if not features:
-        raise ValueError("Le contrat ne déclare aucune variable (clé features).")
+    if not features or not isinstance(features, list):
+        raise ValueError("Le contrat ne déclare aucune variable (clé features, une liste).")
 
     fields: dict[str, Any] = {}
-    for feature in features:
+    for position, feature in enumerate(features, start=1):
+        if not isinstance(feature, dict) or not feature.get("name") or not feature.get("type"):
+            raise ValueError(f"Variable n° {position} du contrat sans name ou sans type.")
         feature_name = feature["name"]
+        if (
+            not isinstance(feature_name, str)
+            or not FEATURE_NAME_PATTERN.fullmatch(feature_name)
+            or feature_name.startswith("model_")
+        ):
+            raise ValueError(
+                f"Nom de variable invalide : {feature_name!r} (lettres, chiffres et _, "
+                "commence par une lettre, ne commence pas par model_)."
+            )
         if feature_name in fields:
             raise ValueError(f"Variable déclarée deux fois dans le contrat : {feature_name}.")
         fields[feature_name] = _field_definition(feature)
@@ -280,35 +315,119 @@ def build_request_model(contract: dict[str, Any], name: str = "PredictRequest") 
     return create_model(name, __config__=ConfigDict(extra="forbid"), **fields)
 
 
+def _is_number(value: Any) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+def _value_matches(kind: str, value: Any) -> bool:
+    if kind == "categorical":
+        return isinstance(value, str)
+    if kind == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    return _is_number(value)
+
+
+def _member_of(allowed: list[Any]) -> Any:
+    """Validateur : la valeur fait partie de la liste du contrat (erreur de type not_allowed)."""
+    listed = ", ".join(map(str, allowed))
+
+    def check(value: Any) -> Any:
+        if value not in allowed:
+            raise PydanticCustomError(
+                "not_allowed", "valeur non permise, valeurs possibles : {allowed}", {"allowed": listed}
+            )
+        return value
+
+    return AfterValidator(check)
+
+
 def _field_definition(feature: dict[str, Any]) -> tuple[Any, Any]:
-    """Type Python et contraintes Pydantic d'une variable du contrat."""
+    """Type Python et contraintes Pydantic d'une variable du contrat (déjà nommée)."""
+    name = feature["name"]
     kind = feature["type"]
     if kind not in FEATURE_TYPES:
-        raise ValueError(f"Type inconnu pour {feature['name']} : {kind} (attendu : {', '.join(FEATURE_TYPES)}).")
+        raise ValueError(f"Type inconnu pour {name} : {kind} (attendu : {', '.join(FEATURE_TYPES)}).")
+
+    for key in ("min", "max"):
+        bound = feature.get(key)
+        if bound is None:
+            continue
+        if kind == "categorical" or not _is_number(bound):
+            raise ValueError(f"{name} : {key} doit être un nombre, et seulement pour numeric ou integer.")
+        if not math.isfinite(bound):
+            raise ValueError(f"{name} : {key} doit être un nombre fini.")
+        if kind == "integer" and not isinstance(bound, int):
+            raise ValueError(f"{name} : {key} doit être un entier pour une variable integer.")
+    low, high = feature.get("min"), feature.get("max")
+    if low is not None and high is not None and low > high:
+        raise ValueError(f"{name} : min est supérieur à max.")
 
     allowed = feature.get("allowed")
-    if allowed:
-        annotation: Any = Literal[tuple(allowed)]
-    elif kind == "categorical":
-        annotation = str
-    elif kind == "integer":
-        annotation = int
-    else:
-        annotation = float
+    if allowed is not None:
+        if not isinstance(allowed, list) or not allowed:
+            raise ValueError(f"{name} : allowed doit être une liste non vide.")
+        if not all(_value_matches(kind, value) for value in allowed):
+            raise ValueError(f"{name} : une valeur de allowed ne correspond pas au type {kind}.")
+        if kind != "categorical" and not all(math.isfinite(value) for value in allowed):
+            raise ValueError(f"{name} : allowed ne contient que des nombres finis.")
+        if kind == "numeric" and any(isinstance(value, int) and abs(value) > MAX_EXACT_INTEGER for value in allowed):
+            # Une variable numeric est lue en float : au-delà de 2**53, deux entiers se confondent.
+            raise ValueError(f"{name} : une valeur de allowed est trop grande pour être comparée sans perte.")
+        if any((low is not None and value < low) or (high is not None and value > high) for value in allowed):
+            raise ValueError(f"{name} : une valeur de allowed sort des bornes min et max.")
+        if len(set(allowed)) != len(allowed):
+            raise ValueError(f"{name} : allowed contient deux fois la même valeur.")
 
+    required = feature.get("required", True)
+    if not isinstance(required, bool):
+        raise ValueError(f"{name} : required doit valoir true ou false.")
+    for key in ("label", "unit"):
+        if feature.get(key) is not None and not isinstance(feature[key], str):
+            raise ValueError(f"{name} : {key} doit être un texte.")
+
+    # strict : ni texte ("12000"), ni booléen, ni décimal pour un entier. Les nombres non finis
+    # (Infinity, NaN, que le décodeur JSON de Python accepte) sont refusés.
+    base = {"categorical": str, "integer": int, "numeric": float}[kind]
     constraints: dict[str, Any] = {}
-    if kind != "categorical":
-        if feature.get("min") is not None:
-            constraints["ge"] = feature["min"]
-        if feature.get("max") is not None:
-            constraints["le"] = feature["max"]
+    if allowed is not None and kind == "categorical":
+        # Un Literal de textes refuse déjà tout ce qui n'est pas l'un de ces textes.
+        annotation: Any = Literal[tuple(allowed)]
+    elif allowed is not None:
+        # Un Literal de nombres accepterait 36.0 ou true : type strict, bornes, puis contrôle
+        # d'appartenance. Le JSON Schema est écrit à la main sur ce type, pour que enum reste
+        # dans la branche non nulle d'un champ facultatif.
+        published: dict[str, Any] = {"type": "integer" if kind == "integer" else "number", "enum": list(allowed)}
+        metadata: list[Any] = [Strict()]
+        if kind == "numeric":
+            metadata.append(AllowInfNan(False))
+        if low is not None:
+            metadata.append(annotated_types.Ge(low))
+            published["minimum"] = low
+        if high is not None:
+            metadata.append(annotated_types.Le(high))
+            published["maximum"] = high
+        annotation = Annotated[base, *metadata, _member_of(allowed), WithJsonSchema(published)]
+    else:
+        annotation = base
+        constraints["strict"] = True
+        if kind == "numeric":
+            constraints["allow_inf_nan"] = False
+        if low is not None:
+            constraints["ge"] = low
+        if high is not None:
+            constraints["le"] = high
+
+    if feature.get("example") is not None:
+        try:
+            TypeAdapter(Annotated[annotation, Field(**constraints)]).validate_python(feature["example"])
+        except ValidationError as error:
+            raise ValueError(f"{name} : example ne respecte pas le type ou les contraintes de la variable.") from error
+        constraints["examples"] = [feature["example"]]
     if feature.get("label"):
         constraints["title"] = feature["label"]
     if feature.get("unit"):
         constraints["description"] = f"Unité : {feature['unit']}"
-    if feature.get("example") is not None:
-        constraints["examples"] = [feature["example"]]
 
-    if feature.get("required", True):
+    if required:
         return annotation, Field(..., **constraints)
     return annotation | None, Field(default=None, **constraints)
