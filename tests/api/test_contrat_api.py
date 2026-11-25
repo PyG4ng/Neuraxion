@@ -1,7 +1,8 @@
 """Forme du contrat C4 : modèles Pydantic, exemples de docs/api.md et routes encore vides.
 
 Ces tests ne dépendent ni de PostgreSQL ni de MLflow. Ils restent valables quand A1, A2,
-A3 et F1 remplacent les corps des routes, sauf ceux qui attendent la réponse 501.
+A3 et F1 remplacent les corps des routes, sauf ceux qui attendent la réponse 501
+(POST /train n'en fait plus partie depuis A3).
 """
 
 import json
@@ -164,7 +165,6 @@ def test_request_model_refuses_broken_contracts(contract):
 @pytest.mark.parametrize(
     ("route", "body", "task"),
     [
-        ("/train", {"preset": "rapide"}, "A3"),
         ("/feedback", {"inference_id": "6f1c2a7e-3b4d-4c8a-9e21-5d7f0a1b2c3d", "feedback": "agree"}, "F1"),
     ],
 )
@@ -241,15 +241,22 @@ def test_predict_requires_a_body(client):
 
 
 @pytest.mark.parametrize("body", [None, {}])
-def test_train_without_preset_uses_default_and_reaches_the_stub(client, body):
-    response = client.post("/train") if body is None else client.post("/train", json=body)
-    assert response.status_code == 501
+def test_train_without_preset_uses_default(client, body, monkeypatch):
+    received = []
+    example = schemas.TrainResponse.model_config["json_schema_extra"]["examples"][1]
+    monkeypatch.setenv("TRAIN_API_KEY", "cle-de-test")
+    client.app.dependency_overrides[train.get_train_and_promote] = lambda: lambda preset: received.append(preset) or example
+    headers = {"X-API-Key": "cle-de-test"}
+    response = client.post("/train", headers=headers) if body is None else client.post("/train", json=body, headers=headers)
+    assert response.status_code == 200
+    assert received == ["default"]
+    assert schemas.TrainResponse.model_validate(response.json()).status == "rejected"
 
 
 def test_wire_codes_are_the_documented_strings(client):
     # Valeur littérale, indépendante de l'énumération : un client se fie à cette chaîne.
     assert client.post("/predict", json=VALID_REQUEST).json()["code"] == "MODEL_UNAVAILABLE"
-    assert client.post("/train", json={"preset": "rapide"}).json()["code"] == "NOT_IMPLEMENTED"
+    assert client.post("/train", json={"preset": "rapide"}).json()["code"] == "UNAUTHORIZED"
 
 
 def test_openapi_announces_the_documented_error_statuses(client):

@@ -21,7 +21,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.testclient import TestClient
 from starlette.exceptions import HTTPException
 
-from src.api import errors, main, schemas
+from src.api import errors, main, schemas, train
 from src.api.errors import ApiError, french_message
 from src.db import connection
 
@@ -232,7 +232,15 @@ def test_validation_errors_never_echo_the_submitted_values(client):
         assert SECRET_VALUE not in response.text
 
 
-def test_train_preset_errors_use_the_common_format(client):
+def _open_train_route(client, monkeypatch):
+    """Clé configurée et fausse train_and_promote : /train va jusqu'à la validation du corps (A3)."""
+    monkeypatch.setenv("TRAIN_API_KEY", "cle-de-test")
+    client.app.dependency_overrides[train.get_train_and_promote] = lambda: lambda preset: None
+    client.headers["X-API-Key"] = "cle-de-test"
+
+
+def test_train_preset_errors_use_the_common_format(client, monkeypatch):
+    _open_train_route(client, monkeypatch)
     body = client.post("/train", json={"preset": "lent"}).json()
     assert body["code"] == "VALIDATION_ERROR"
     assert body["errors"][0]["field"] == "preset"
@@ -300,10 +308,10 @@ def test_unexpected_error_gets_500_without_its_message(make_app, caplog):
 
 def test_existing_stub_routes_still_answer_501(client):
     feedback = {"inference_id": "6f1c2a7e-3b4d-4c8a-9e21-5d7f0a1b2c3d", "feedback": "agree"}
-    for route, body in (("/train", {"preset": "rapide"}), ("/feedback", feedback)):
-        response = client.post(route, json=body)
-        assert response.status_code == 501
-        assert response.json()["code"] == "NOT_IMPLEMENTED"
+    # POST /predict (A2) et POST /train (A3) ne sont plus des routes vides.
+    response = client.post("/feedback", json=feedback)
+    assert response.status_code == 501
+    assert response.json()["code"] == "NOT_IMPLEMENTED"
 
 
 # --- logs ------------------------------------------------------------------
@@ -1091,7 +1099,8 @@ def test_model_info_serializers_are_not_called(make_app):
     assert TestClient(app).get("/health").json()["status"] == "ok"
 
 
-def test_train_validation_log_names_the_declared_preset(client, caplog):
+def test_train_validation_log_names_the_declared_preset(client, caplog, monkeypatch):
+    _open_train_route(client, monkeypatch)
     with caplog.at_level(logging.INFO, logger="neuraxion"):
         client.post("/train", json={"preset": "lent", SECRET_VALUE: 1})
     assert "preset (literal_error)" in caplog.text
