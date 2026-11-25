@@ -91,10 +91,14 @@ def database(monkeypatch) -> Database:
     for name in ("PGSERVICE", "PGSERVICEFILE"):
         monkeypatch.delenv(name, raising=False)
     environ = _configured_environ()
+    missing = [name for name in connection.REQUIRED_VARIABLES if name not in environ]
+    if missing:
+        pytest.skip(f"PostgreSQL non configuré : {', '.join(missing)} absentes. Voir docs/api.md (tests A4).")
     try:
         connection.connection_params(environ)
     except connection.DatabaseNotConfigured as error:
-        pytest.skip(f"PostgreSQL non configuré : {error} Voir docs/api.md (tests A4).")
+        # Base demandée mais mal décrite (POSTGRES_PORT non entier) : un échec, pas un saut.
+        pytest.fail(f"Configuration PostgreSQL invalide : {error}", pytrace=False)
     schema = SCHEMA_PREFIX + secrets.token_hex(6)
     try:
         with connection.connect(environ) as conn:
